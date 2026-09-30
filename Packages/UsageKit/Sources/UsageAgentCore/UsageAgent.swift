@@ -1,0 +1,569 @@
+import Foundation
+import UsageCore
+
+/// What the status window shows about the background budget.
+public struct BudgetStatus: Equatable, Sendable {
+    public var cap: Int
+    /// Requests in the trailing 24 hours.
+    public var requests24h: Int
+    /// The earliest an ordinary change could be requested.
+    public var nextOrdinary: Date
+}
+
+public struct TickReport: Equatable, Sendable {
+    public var writtenAt: Date
+    public var status: ProviderUsage.Status
+    public var error: String?
+    /// Empty when no reload was requested.
+    public var reloadReasons: [ReloadReason]
+    /// A visible change is waiting for the scheduler to allow a reload.
+    public var pending = false
+    /// Set while the scheduler's memory cannot be read or saved.
+    public var stateError: String?
+    /// Runs since launch where cswap left a helper holding its output.
+    public var helperWarnings = 0
+    /// Set when the snapshot could not be written.
+    public var writeError: String?
+    /// Why the last Codex app-server call failed, while it stands.
+    public var codexError: String?
+    /// When the app-server was last called, and the earliest the next
+    /// call could go.
+    public var codexCheckedAt: Date?
+    public var codexNextCheck: Date?
+    /// Set while the Codex call log cannot be read or saved.
+    public var codexCallsError: String?
+    /// The background budget, for the status window.
+    public var budget: BudgetStatus?
+    /// Set when the container was replaced at its path: the agent has
+    /// stopped polling and writing for good (`error` says what to do).
+    public var containerChanged = false
+}
+
+/// One poll: run cswap, build the next snapshot, and write it atomically.
+/// Writing happens every poll, so the snapshot's age shows the agent is
+/// alive. Reloading is a separate decision: the `ReloadScheduler`, whose
+/// memory is persisted beside the snapshot, spends WidgetKit's small daily
+/// budget only on changes a person would notice.
+public actor UsageAgent {
+    public let directory: URL
+    private let runner: any CswapRunning
+    private let reload: @Sendable () -> Void
+    private let clock: @Sendable () -> SchedulerClock
+    /// Saves the reload state; tests pass one that fails on demand.
+    private let saveState: @Sendable (ReloadState, URL) throws -> Void
+    /// This agent's last write number, kept in writer-state.json; at launch
+    /// the higher of that and the snapshot's.
+    private var lastWriteSequence: Int?
+    /// Drawn at each launch and written into every snapshot; drawn again
+    /// when the write numbers wrap.
+    private var writerId = UUID().uuidString
+    public var currentWriterId: String { writerId }
+    private var loggedAdoption = false
+    private var previous: UsageSnapshot?
+    private var reloadState = ReloadState()
+    /// What is on disk; the state is dirty while it differs.
+    private var savedState: ReloadState?
+    /// Set while the state cannot be read or saved; reloads are then
+    /// limited to one an hour, tracked in memory.
+    private var stateError: String?
+    private var loaded = false
+    private var helperWarnings = 0
+    /// The session and number of the last press seen; presses on disk at
+    /// launch are old.
+    private var lastSeenRefresh: (session: String, sequence: Int)
+    /// A press's completion reload: at most one this often.
+    public static let pressReloadSpacing: TimeInterval = 10 * 60
+    private var lastUserRefresh: SchedulerClock?
+    /// The press being answered: its time tells whether the intent was
+    /// still waiting when the answer was written.
+    private var takenRequest: RefreshRequest?
+    /// When this process started, as the scheduler measures time.
+    private let launch: SchedulerClock
+
+    private var codex: (any CodexSourcing)?
+    /// The Codex reading shown: never re-dated, aged by the continuous
+    /// clock. A live app-server answer always replaces it; a rollout event
+    /// only when strictly newer than it.
+    private var codexCurrent: RememberedReading?
+    private var codexAppServerError: String?
+    /// The app-server calls of the last day, kept on disk.
+    private var codexCalls = CodexCallLog()
+    /// Set while the call log cannot be read or saved.
+    private var codexCallsError: String?
+    /// A call has been made, or counted, since launch (or since Codex was
+    /// turned on).
+    private var codexCalledThisLaunch = false
+    /// When the app-server last answered; kept in the snapshot's extras.
+    private var codexAppServerCheckedAt: Date?
+
+    /// Set once the container was replaced at its path: nothing runs or is
+    /// written after that.
+    private var stopped = false
+    /// The container path could not be checked, and that has been logged.
+    private var loggedUncheckable = false
+
+    public init(
+        directory: URL,
+        runner: any CswapRunning,
+        reload: @escaping @Sendable () -> Void,
+        clock: @escaping @Sendable () -> SchedulerClock = { SchedulerClock.now() },
+        codex: (any CodexSourcing)? = nil,
+        saveState: @escaping @Sendable (ReloadState, URL) throws -> Void = { try ReloadStateStore.write($0, to: $1) }
+    ) {
+        self.codex = codex
+        self.saveState = saveState
+        self.directory = directory
+        self.runner = runner
+        self.reload = reload
+        self.clock = clock
+        self.launch = clock()
+        let onDisk = RefreshRequestStore.read(in: directory)
+        self.lastSeenRefresh = (onDisk?.session ?? "", onDisk?.sequence ?? 0)
+    }
+
+    /// Turns Codex reading on (with a source) or off (nil). Off hides the
+    /// block (it stays in the snapshot, marked hidden) and stops polling but
+    /// keeps what was read; on shows it again and asks the app-server only
+    /// if the day's ceiling allows.
+    public func setCodex(_ source: (any CodexSourcing)?) {
+        codex = source
+        if source != nil { codexCalledThisLaunch = false }
+    }
+
+    /// The codex provider block for this poll, or nil when Codex is off.
+    private func codexBlock(now stamp: SchedulerClock) async -> ProviderUsage? {
+        guard let codex else { return nil }
+        let rollout = codex.rolloutReading(now: stamp.wall)
+        if CodexCallPolicy.reason(calls: codexCalls.calls, firstOfLaunch: !codexCalledThisLaunch,
+                                  newestRollout: rollout?.measuredAt, now: stamp) != nil {
+            codexCalledThisLaunch = true
+            // No call goes unless it is on disk first.
+            if recordCodexCall(stamp) {
+                await askCodexAppServer(codex)
+                // Show Codex may have been turned off while the call was out:
+                // then the block stays hidden.
+                guard self.codex != nil else { return nil }
+            }
+        }
+        return mergeCodex(codex, rollout: rollout, stamp: stamp)
+    }
+
+    private func askCodexAppServer(_ codex: any CodexSourcing) async {
+        switch await codex.appServerReading() {
+        case .success(var reading):
+            // A live answer is newer than anything cached, whatever the
+            // wall clock says.
+            reading.planType = reading.planType ?? codexCurrent?.reading.planType
+            reading.resetCreditsAvailable = reading.resetCreditsAvailable ?? codexCurrent?.reading.resetCreditsAvailable
+            codexCurrent = RememberedReading(reading, at: clock())
+            codexAppServerCheckedAt = reading.measuredAt
+            codexAppServerError = nil
+        case .failure(let failure):
+            codexAppServerError = failure.reason
+        }
+    }
+
+    private func mergeCodex(_ codex: any CodexSourcing, rollout: CodexReading?, stamp: SchedulerClock) -> ProviderUsage {
+        // A rollout event replaces the cached reading only when its own time
+        // is strictly newer than the cache's own time; neither is ever
+        // re-dated, so a clock set back cannot let an older event in.
+        if let rollout, codexCurrent.map({ rollout.measuredAt > $0.reading.measuredAt }) ?? true {
+            var next = rollout
+            next.resetCreditsAvailable = codexCurrent?.reading.resetCreditsAvailable
+            next.planType = rollout.planType ?? codexCurrent?.reading.planType
+            codexCurrent = RememberedReading(next, at: stamp)
+        }
+        return CodexMerge.block(rollout: nil, appServer: nil, lastKnown: codexCurrent?.reading(at: stamp),
+                                appServerCheckedAt: codexAppServerCheckedAt, appServerError: codexAppServerError,
+                                codexFound: codex.codexFound, now: stamp.wall)
+    }
+
+    /// The codex block of a snapshot as a reading, so a restart starts from
+    /// what was shown: windows, plan, reset count and measurement time.
+    static func lastKnownCodex(in snapshot: UsageSnapshot?) -> CodexReading? {
+        guard let block = snapshot?.provider(CodexMerge.provider), let account = block.accounts.first,
+              let measured = account.fetchedAt, !account.windows.isEmpty else { return nil }
+        var plan: String?
+        if case .string(let raw)? = block.extras[ProviderDetails.planKey] { plan = raw }
+        return CodexReading(source: CodexReading.Source(rawValue: block.source) ?? .rollout, measuredAt: measured,
+                            windows: account.windows, planType: plan,
+                            resetCreditsAvailable: ProviderDetails.resetCredits(in: block.extras))
+    }
+
+    /// Logs a call before it is made, so even a call that hangs counts.
+    /// False when the log could not be written: then the call must not go.
+    private func recordCodexCall(_ stamp: SchedulerClock) -> Bool {
+        var next = codexCalls
+        next.calls = CodexCallPolicy.recent(codexCalls.calls, now: stamp) + [stamp]
+        guard saveCodexCalls(next) else { return false }
+        codexCalls = next
+        return true
+    }
+
+    @discardableResult
+    private func saveCodexCalls(_ log: CodexCallLog) -> Bool {
+        do {
+            try CodexCallLogStore.write(log, to: codexCallsURL)
+            codexCallsError = nil
+            return true
+        } catch {
+            codexCallsError = "Codex call log could not be saved: \(Redactor.redactEmails(error.localizedDescription))"
+            return false
+        }
+    }
+
+    /// Reads the call log once per launch and writes it straight back.
+    /// A log that is corrupt or from another version counts as a full day
+    /// (eight calls now). With no log, a snapshot whose Codex numbers came
+    /// from the app-server within the day (the 15 minute build kept no log)
+    /// counts that day as full from that answer. If the log cannot be
+    /// written the agent is in the reload scheduler's conservative mode:
+    /// the launch itself counts as a call, and no call goes until the log
+    /// can be written.
+    private func loadCodexCalls(previous: UsageSnapshot?) {
+        switch CodexCallLogStore.read(from: codexCallsURL) {
+        case .loaded(let log):
+            codexCalls = log
+        case .missing:
+            // An answer older than a day falls outside the policy's window by itself.
+            if let answered = Self.lastAppServerAnswer(in: previous) {
+                let at = SchedulerClock(wall: min(answered, launch.wall), continuous: 0, boot: nil)
+                codexCalls = CodexCallLog(calls: Array(repeating: at, count: CodexCallPolicy.dailyCeiling))
+            }
+        case .unreadable:
+            codexCalls = CodexCallLog(calls: Array(repeating: launch, count: CodexCallPolicy.dailyCeiling))
+        }
+        if !saveCodexCalls(codexCalls) {
+            codexCalls.calls.append(launch)
+            codexCalledThisLaunch = true
+        }
+    }
+
+    /// When the app-server last answered, as the snapshot tells it: the
+    /// recorded answer time; else, for a snapshot from before it was
+    /// recorded, the codex block's measurement time, whatever its source or
+    /// reset count (that build asked every 15 minutes).
+    static func lastAppServerAnswer(in snapshot: UsageSnapshot?) -> Date? {
+        guard let block = snapshot?.provider(CodexMerge.provider) else { return nil }
+        if case .string(let text)? = block.extras[CodexMerge.appServerCheckedAtKey], let date = ISODate.parse(text) {
+            return date
+        }
+        return block.accounts.first?.fetchedAt
+    }
+
+    public var codexCallsURL: URL { directory.appendingPathComponent(CodexCallLogStore.fileName) }
+    public var snapshotURL: URL { directory.appendingPathComponent(SharedContainer.snapshotFileName) }
+    public var reloadLogURL: URL { directory.appendingPathComponent(SharedContainer.agentLogFileName) }
+    public var reloadStateURL: URL { directory.appendingPathComponent(ReloadStateStore.fileName) }
+
+    /// Shown in the status window once the agent has stopped because its
+    /// container was replaced.
+    public static let containerReplacedMessage = "The data folder was replaced. Quit and reopen Usage Widget."
+
+    /// Presses within this long of the last one handled are ignored.
+    public static let refreshDebounce: TimeInterval = 30
+
+    /// True once for each new press of the refresh button: a request
+    /// numbered past the last one seen (and past any on disk at launch),
+    /// and not within `refreshDebounce` of the last one handled, on the
+    /// continuous clock. The caller then runs `tick(userRequested: true)`.
+    public func takeRefreshRequest() -> Bool {
+        guard !stopped, let request = RefreshRequestStore.read(in: directory) else { return false }
+        // A new session (the file was deleted or damaged) counts from 0.
+        let baseline = request.session == lastSeenRefresh.session ? lastSeenRefresh.sequence : 0
+        guard request.sequence > baseline else { return false }
+        lastSeenRefresh = (request.session, request.sequence)
+        let stamp = clock()
+        if let last = lastUserRefresh, stamp.seconds(since: last) < Self.refreshDebounce { return false }
+        lastUserRefresh = stamp
+        takenRequest = request
+        return true
+    }
+
+    public func tick() async -> TickReport {
+        await tick(userRequested: false)
+    }
+
+    /// A press's completion reload, when its gates allow: under the cap, at
+    /// most one every 10 minutes, and inside the conservative hour when the
+    /// state cannot be saved. It counts toward the cap, starts the
+    /// background spacing, and records what it shows.
+    private func completionCandidate(_ state: ReloadState, current: DisplayFingerprint, stamp: SchedulerClock,
+                                     conservative: Bool) -> (state: ReloadState, id: Int, reasons: [ReloadReason])? {
+        var press = state
+        press.requests = state.requests.filter { stamp.seconds(since: $0) < ReloadScheduler.capWindow }
+        guard press.requests.count < ReloadScheduler.dailyCap,
+              state.lastCapExemption.map({ stamp.seconds(since: $0) >= Self.pressReloadSpacing }) ?? true,
+              !conservative || (state.lastRequest.map { stamp.seconds(since: $0) >= ReloadScheduler.conservativeSpacing } ?? true)
+        else { return nil }
+        let reasons = ReloadScheduler.pressReasons(state, current: current, clock: stamp)
+        press.requests.append(stamp)
+        press.lastRequest = stamp
+        press.lastCapExemption = stamp
+        press.requested = current
+        press.pending = false
+        press.pendingSince = nil
+        let id = press.takeRequestId()
+        return (press, id, reasons)
+    }
+
+    /// A report for an agent that has stopped: no poll, no write.
+    private static func stoppedReport(at now: Date) -> TickReport {
+        var report = TickReport(writtenAt: now, status: .error, error: nil, reloadReasons: [])
+        report.containerChanged = true
+        report.error = containerReplacedMessage
+        return report
+    }
+
+    /// One poll. With `userRequested`, the reload that follows skips the
+    /// spacing (it still counts toward the daily cap).
+    public func tick(userRequested: Bool) async -> TickReport {
+        if stopped { return Self.stoppedReport(at: clock().wall) }
+        // The container is anchored once at launch. Another folder at its
+        // path stops the agent for good: no poll, no write into either
+        // folder, nothing migrated. The app logs it and asks for a quit and
+        // reopen; the lock on the old folder is simply kept.
+        switch ContainerRoot.revalidate(directory) {
+        case .replaced:
+            stopped = true
+            return Self.stoppedReport(at: clock().wall)
+        case .refused(let reason):
+            // The path cannot be checked, not a new folder: the anchor still
+            // works, so polling goes on; said once until it clears.
+            if !loggedUncheckable {
+                loggedUncheckable = true
+                try? CappedLog.append("\(ISODate.format(clock().wall)) container path could not be checked: "
+                                      + Redactor.redactEmails(reason), to: reloadLogURL, cap: SharedContainer.logCap)
+            }
+        case .unchanged, .missing:
+            loggedUncheckable = false
+        }
+        if !loaded {
+            // A restart keeps the last good accounts and the scheduler's memory.
+            previous = SnapshotStore.read(from: snapshotURL)
+            lastWriteSequence = max(WriterStateStore.read(in: directory)?.lastSequence ?? 0, previous?.writeSequence ?? 0)
+            if codexCurrent == nil, let seed = Self.lastKnownCodex(in: previous) {
+                // The age the snapshot kept on the continuous clock, plus
+                // the time since it was written (never less), so a wall
+                // clock moved back cannot make old numbers look fresh.
+                let now = clock()
+                var age: TimeInterval?
+                if let kept = previous?.provider(CodexMerge.provider)?.accounts.first?.ageSeconds, let written = previous?.writtenAt {
+                    age = kept + max(0, now.wall.timeIntervalSince(written))
+                }
+                codexCurrent = RememberedReading(seed, at: now, age: age)
+            }
+            if case .string(let text)? = previous?.provider(CodexMerge.provider)?.extras[CodexMerge.appServerCheckedAtKey] {
+                codexAppServerCheckedAt = ISODate.parse(text)
+            }
+            loadCodexCalls(previous: previous)
+            // Earlier builds left a note here when a press's reload was held.
+            SafeFile.remove(directory.appendingPathComponent("refresh-result.json"))
+            switch ReloadStateStore.read(from: reloadStateURL) {
+            case .loaded(let state):
+                reloadState = state
+            case .missing:
+                break
+            case .unreadable(let reason):
+                stateError = "Reload state could not be read: \(reason)"
+            }
+            // A state that reads but cannot be saved (a locked file, say)
+            // would let every restart start from the same old memory, so it
+            // is saved straight back now; failing that counts like failing
+            // to read it.
+            if stateError == nil {
+                do {
+                    try saveState(reloadState, reloadStateURL)
+                    savedState = reloadState
+                } catch {
+                    stateError = "Reload state could not be saved: \(Redactor.redactEmails(error.localizedDescription))"
+                }
+            }
+            if stateError != nil {
+                // With no memory to trust, the launch itself counts as a
+                // request: restarting cannot buy a reload inside the
+                // conservative hour.
+                if reloadState.lastRequest.map({ launch.seconds(since: $0) > 0 }) ?? true {
+                    reloadState.lastRequest = launch
+                }
+            }
+            loaded = true
+        }
+
+        let result = await runner.runList()
+        if case .success(let output) = result, output.leftHelper { helperWarnings += 1 }
+        let outcome = CswapInterpreter.interpret(result)
+        let stamp = clock()
+        let now = stamp.wall
+        var built = SnapshotBuilder.updating(
+            previous,
+            provider: CswapListMapper.provider,
+            source: CswapListMapper.source,
+            outcome: outcome,
+            now: now
+        )
+        // Codex off keeps its last block, hidden, so turning it on again (or
+        // restarting) starts from those numbers.
+        let keptCodex = built.providers.first { $0.provider == CodexMerge.provider }
+        built.providers.removeAll { $0.provider == CodexMerge.provider }
+        if let block = await codexBlock(now: stamp) {
+            built.providers.append(block)
+        } else if var kept = keptCodex {
+            kept.hidden = true
+            built.providers.append(kept)
+        }
+        // A reload state problem is shown where a cswap error would be,
+        // without marking the provider as failed.
+        if let stateError, let index = built.providers.firstIndex(where: { $0.provider == CswapListMapper.provider }),
+           built.providers[index].status == .ok {
+            built.providers[index].error = stateError
+        }
+        let next = SnapshotValidator.sanitized(built)
+        let block = next.provider(CswapListMapper.provider)
+        var report = TickReport(
+            writtenAt: now,
+            status: block?.status ?? .error,
+            error: block?.error,
+            reloadReasons: [],
+            writeError: nil
+        )
+        // Codex's collector state is reported even when the snapshot cannot be written.
+        report.codexError = next.provider(CodexMerge.provider)?.collectorError
+        if codex != nil {
+            report.codexCheckedAt = codexCalls.calls.last?.wall
+            report.codexNextCheck = CodexCallPolicy.nextEligible(calls: codexCalls.calls, now: stamp)
+            report.codexCallsError = codexCallsError
+        }
+
+        // What to ask WidgetKit for is decided before the snapshot is
+        // written; nothing is asked for without its snapshot.
+        let conservative = stateError != nil
+        let current = DisplayFingerprint(next)
+        var state = reloadState
+        var fire: (id: Int, kind: ReloadLog.Kind, reasons: [ReloadReason], urgent: Bool)?
+        // A press's completion reload waits for the snapshot write: until
+        // its numbers are on disk nothing about them is saved as requested.
+        var pressCandidate: (state: ReloadState, id: Int, reasons: [ReloadReason])?
+        if userRequested {
+            // A press's poll. The intent's own reload shows these numbers and
+            // is not budgeted; for a poll slower than the intent's wait the
+            // agent adds one completion reload, which WidgetKit budgets like
+            // any background reload: it counts toward the cap, starts the
+            // background spacing, and comes at most every 10 minutes. The
+            // background decision never runs inside a press.
+            // The intent looks for the answer for 5 s, every 0.25 s. A
+            // snapshot written within that sees its own unbudgeted reload,
+            // so only a later one needs the completion reload.
+            let waited = takenRequest.map { now.timeIntervalSince($0.requestedAt) } ?? .infinity
+            if waited >= RefreshRequestStore.intentWait - RefreshRequestStore.intentPoll {
+                pressCandidate = completionCandidate(state, current: current, stamp: stamp, conservative: conservative)
+            }
+        } else {
+            let (decision, decided) = ReloadScheduler.decide(state, current: current, clock: stamp,
+                                                             conservative: conservative)
+            state = decided
+            if decision.fire, let id = decision.id { fire = (id, .background, decision.reasons, decision.urgent) }
+        }
+
+        var written = next
+        written.writerId = writerId
+        do {
+            let outcome = try SnapshotStore.writeNumbered(written, to: snapshotURL, after: lastWriteSequence)
+            lastWriteSequence = outcome.sequence
+            written.writeSequence = outcome.sequence
+            if let id = outcome.writerId {
+                writerId = id
+                written.writerId = id
+            }
+            try? WriterStateStore.write(WriterState(lastSequence: outcome.sequence), in: directory)
+            // Another writer numbered past this one: carry on from its
+            // number, and say so once.
+            if let adopted = outcome.adopted, !loggedAdoption {
+                loggedAdoption = true
+                try? CappedLog.append("\(ISODate.format(now)) adopted write number \(adopted) from another writer",
+                                      to: reloadLogURL, cap: SharedContainer.logCap)
+            }
+        } catch {
+            // Nothing is asked for or saved as requested without its snapshot.
+            report.writeError = Redactor.redactEmails((error as NSError).localizedDescription)
+            return report
+        }
+        previous = written
+        // A press made while this poll ran (or just before it) is answered
+        // by this snapshot: taking it again would run cswap once more. If
+        // the answer came too late for the intent to see it, and this poll
+        // asks for no reload of its own, the completion reload follows.
+        if let request = RefreshRequestStore.read(in: directory) {
+            let baseline = request.session == lastSeenRefresh.session ? lastSeenRefresh.sequence : 0
+            if request.sequence > baseline, RefreshState.answers(written.mark, request) {
+                lastSeenRefresh = (request.session, request.sequence)
+                if fire == nil,
+                   now.timeIntervalSince(request.requestedAt) >= RefreshRequestStore.intentWait - RefreshRequestStore.intentPoll {
+                    pressCandidate = completionCandidate(state, current: current, stamp: stamp, conservative: conservative)
+                }
+            }
+        }
+        // The completion reload fires only once its time is saved.
+        if let pressCandidate {
+            do {
+                try saveState(pressCandidate.state, reloadStateURL)
+                state = pressCandidate.state
+                savedState = pressCandidate.state
+                fire = (pressCandidate.id, .press, pressCandidate.reasons, true)
+            } catch {
+                stateError = "Reload state could not be saved: \(Redactor.redactEmails(error.localizedDescription))"
+            }
+        }
+
+        reloadState = state
+        if state != savedState {
+            do {
+                try saveState(state, reloadStateURL)
+                savedState = state
+                stateError = nil
+            } catch {
+                stateError = "Reload state could not be saved: \(Redactor.redactEmails(error.localizedDescription))"
+            }
+        }
+        let requests24h = state.requests.filter { stamp.seconds(since: $0) < ReloadScheduler.capWindow }.count
+        report.budget = BudgetStatus(cap: ReloadScheduler.dailyCap, requests24h: requests24h,
+                                     nextOrdinary: ReloadScheduler.nextOrdinary(state, clock: stamp,
+                                                                                conservative: stateError != nil))
+        report.stateError = stateError
+        report.helperWarnings = helperWarnings
+        report.pending = state.pending
+        guard let fire else { return report }
+
+        reload()
+        report.reloadReasons = fire.reasons
+        let line = ReloadLog.line(at: now, reasons: fire.reasons, urgent: fire.urgent, status: report.status.rawValue,
+                                  requests24h: requests24h, id: fire.id, kind: fire.kind)
+        try? CappedLog.append(line, to: reloadLogURL, cap: SharedContainer.logCap)
+        return report
+    }
+}
+
+/// A reading kept between polls. Its measurement time is never changed;
+/// its age at a later poll is the age it had when kept plus the time that
+/// really passed on the continuous clock, so setting the wall clock back or
+/// forward neither freshens nor ages it. A reading dated ahead of when it
+/// was kept counts as taken then.
+struct RememberedReading {
+    var reading: CodexReading
+    var kept: SchedulerClock
+    var ageWhenKept: TimeInterval
+
+    /// - Parameter age: the reading's age when kept, when known; otherwise
+    ///   it is measured from the wall clock.
+    init(_ reading: CodexReading, at stamp: SchedulerClock, age: TimeInterval? = nil) {
+        self.reading = reading
+        self.kept = stamp
+        self.ageWhenKept = age ?? max(0, stamp.wall.timeIntervalSince(reading.measuredAt))
+    }
+
+    func reading(at stamp: SchedulerClock) -> CodexReading {
+        var copy = reading
+        copy.observedAge = stamp.seconds(since: kept) + ageWhenKept
+        return copy
+    }
+}

@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "activeAccountNumber": 2,
+  "accounts": [
+    {
+      "number": 1,
+      "email": "alex@example.com",
+      "active": false,
+      "usageStatus": "ok",
+      "usage": {
+        "sevenDay": {
+          "pct": 41.0,
+          "resetsAt": "2026-01-18T18:00:00+00:00",
+          "expectedPct": 50.0,
+          "aheadOfPace": false
+        }
+      },
+      "usageFetchedAt": "2026-01-15T10:00:00Z",
+      "usageAgeSeconds": 12.0
+    },
+    {
+      "number": 2,
+      "email": "sam@example.com",
+      "usageStatus": "ok",
+      "usage": {
+        "fiveHour": {
+          "pct": 0.0
+        },
+        "sevenDay": {
+          "pct": 12.0
+        }
+      },
+      "usageFetchedAt": "2026-01-15T09:58:00Z",
+      "usageAgeSeconds": 90.0
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "activeAccountNumber": 1,
+  "accounts": [
+    {"number": 1, "email": "a1@example.com", "active": true, "usageStatus": "ok",
+     "usage": {"sevenDay": {"pct": 10.0}}, "usageFetchedAt": "2026-09-27T10:00:00Z"},
+    {"number": 2, "email": "a2@example.com", "active": false, "usageStatus": "relogin_required", "usage": null,
+     "lastGoodUsage": {"sevenDay": {"pct": 40.0}}, "lastGoodFetchedAt": "2026-09-26T10:00:00Z"},
+    {"number": 3, "email": "a3@example.com", "active": false, "usageStatus": "no_credentials", "usage": null},
+    {"number": 4, "email": "a4@example.com", "active": false, "usageStatus": "token_expired", "usage": null,
+     "lastGoodUsage": {"sevenDay": {"pct": 55.0}}, "lastGoodFetchedAt": "2026-09-27T08:00:00Z"},
+    {"number": 5, "email": "a5@example.com", "active": false, "usageStatus": "keychain_unavailable", "usage": null},
+    {"number": 6, "email": "a6@example.com", "active": false, "usageStatus": "foreign_credential", "usage": null},
+    {"number": 7, "email": "a7@example.com", "active": false, "usageStatus": "api_key", "usage": null},
+    {"number": 8, "email": "a8@example.com", "active": false, "usageStatus": "unavailable", "usage": null,
+     "usageError": "http-429"},
+    {"number": 9, "email": "a9@example.com", "active": false, "usageStatus": "mystery_state", "usage": null},
+    {"number": 10, "email": "a10@example.com", "active": false, "usageStatus": "ok", "usage": null}
+  ]
+}
