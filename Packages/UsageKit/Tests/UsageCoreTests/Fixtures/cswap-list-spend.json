@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "activeAccountNumber": 1,
+  "accounts": [
+    {"number": 1, "email": "a1@example.com", "active": true, "usageStatus": "ok",
+     "usage": {"spend": {"used": 80.0, "limit": 100.0, "pct": 80.0, "currency": "USD",
+                         "resetsAt": "2026-10-01T00:00:00+00:00", "countdown": "3d 13h", "clock": "Oct 1 00:00"}},
+     "usageFetchedAt": "2026-09-27T10:00:00Z"},
+    {"number": 2, "email": "a2@example.com", "active": false, "usageStatus": "ok",
+     "usage": {"fiveHour": {"pct": 5.0},
+               "sevenDay": {"pct": 20.0},
+               "spend": {"used": 12.5, "limit": 50.0, "pct": 25.0, "currency": "EUR"},
+               "scoped": [{"pct": 30.0, "name": "Fable"}]},
+     "usageFetchedAt": "2026-09-27T10:00:00Z"}
+  ]
+}

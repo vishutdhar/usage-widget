@@ -1,0 +1,18 @@
+# SwiftPM and Xcode build output (one build folder per repo: build/)
+.build/
+build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# Generated from project.yml by XcodeGen on every build
+*.xcodeproj/
+
+# Render test output
+renders/
+
+.DS_Store
+
+# Local databases
+*.db

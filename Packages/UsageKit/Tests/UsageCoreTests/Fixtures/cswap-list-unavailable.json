@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "activeAccountNumber": 3,
+  "accounts": [
+    {
+      "number": 1,
+      "email": "alex@example.com",
+      "active": false,
+      "usageStatus": "unavailable",
+      "usage": null,
+      "lastGoodUsage": {
+        "fiveHour": {
+          "pct": 7.0,
+          "resetsAt": "2026-01-15T14:00:00+00:00"
+        },
+        "sevenDay": {
+          "pct": 58.0,
+          "resetsAt": "2026-01-18T18:00:00+00:00",
+          "expectedPct": 50.0,
+          "aheadOfPace": false
+        }
+      },
+      "lastGoodFetchedAt": "2026-01-15T09:15:00Z",
+      "lastGoodAgeSeconds": 5178.0,
+      "usageError": "http-429"
+    },
+    {
+      "number": 2,
+      "email": "sam@example.com",
+      "active": false,
+      "usageStatus": "token_expired",
+      "usage": null
+    },
+    {
+      "number": 3,
+      "email": "jordan@example.com",
+      "active": true,
+      "usageStatus": "unavailable",
+      "usage": null
+    }
+  ]
+}

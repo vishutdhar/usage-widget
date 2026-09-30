@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "activeAccountNumber": 1,
+  "accounts": [
+    {
+      "number": 1,
+      "email": "alex@example.com",
+      "alias": "work",
+      "active": true,
+      "usageStatus": "ok",
+      "usage": {
+        "fiveHour": {
+          "pct": 64.0,
+          "resetsAt": "2026-01-15T14:00:00+00:00"
+        },
+        "sevenDay": {
+          "pct": 71.0,
+          "resetsAt": "2026-01-16T19:00:00+00:00",
+          "expectedPct": 70.0,
+          "aheadOfPace": false
+        },
+        "scoped": [
+          {
+            "pct": 104.0,
+            "resetsAt": "2026-01-16T19:00:00+00:00",
+            "expectedPct": 70.0,
+            "aheadOfPace": true,
+            "name": "Fable"
+          },
+          {
+            "pct": 33.0,
+            "resetsAt": "2026-01-16T19:00:00+00:00",
+            "name": "Opus"
+          },
+          {
+            "pct": 50.0,
+            "resetsAt": "2026-01-16T19:00:00+00:00"
+          }
+        ]
+      },
+      "usageFetchedAt": "2026-01-15T10:00:00Z"
+    }
+  ]
+}
