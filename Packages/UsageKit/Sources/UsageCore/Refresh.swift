@@ -57,6 +57,8 @@ public enum RefreshRequestStore {
             ?? SnapshotMark(writer: "", sequence: 0)
         let request: RefreshRequest
         let next = read(in: directory).flatMap { previous -> (Int, String)? in
+            // A file without a session id (an earlier build's) starts a new one.
+            guard !previous.session.isEmpty else { return nil }
             let (sequence, overflow) = previous.sequence.addingReportingOverflow(1)
             return overflow || !WriterState.isValid(sequence) ? nil : (sequence, previous.session)
         }
@@ -64,7 +66,8 @@ public enum RefreshRequestStore {
             request = RefreshRequest(requestedAt: date, sequence: sequence, session: session,
                                      afterSnapshot: seen.sequence, afterWriter: seen.writer)
         } else {
-            // No readable file, or its numbers ran out: a new session at 1.
+            // No readable file, no session id, or its numbers ran out: a new
+            // session at 1.
             request = RefreshRequest(requestedAt: date, sequence: 1, session: UUID().uuidString,
                                      afterSnapshot: seen.sequence, afterWriter: seen.writer)
         }

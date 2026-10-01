@@ -272,9 +272,22 @@ public actor UsageAgent {
         // A new session (the file was deleted or damaged) counts from 0.
         let baseline = request.session == lastSeenRefresh.session ? lastSeenRefresh.sequence : 0
         guard request.sequence > baseline else { return false }
-        lastSeenRefresh = (request.session, request.sequence)
+        // A press is marked seen only once a snapshot answering it is
+        // written; until then it stays pending and is looked at again. One
+        // already taken and waiting for its poll is left to that poll.
+        if let taken = takenRequest, taken.session == request.session, taken.sequence == request.sequence {
+            return false
+        }
         let stamp = clock()
-        if let last = lastUserRefresh, stamp.seconds(since: last) < Self.refreshDebounce { return false }
+        if let last = lastUserRefresh, stamp.seconds(since: last) < Self.refreshDebounce {
+            // No second cswap run so soon, but the press is answered: the
+            // last snapshot again under the next number, so the intent's
+            // wait ends and its reload clears "Refreshing".
+            if answerWithTheLastSnapshot(request, at: stamp) {
+                lastSeenRefresh = (request.session, request.sequence)
+            }
+            return false
+        }
         lastUserRefresh = stamp
         takenRequest = request
         return true
@@ -282,6 +295,79 @@ public actor UsageAgent {
 
     public func tick() async -> TickReport {
         await tick(userRequested: false)
+    }
+
+    /// Writes the last snapshot again under the next write number, which
+    /// answers a press made after it, and logs it. Through the same
+    /// container check as a poll. A press noticed too late for its intent
+    /// to see the answer also gets the counted completion reload. False
+    /// when nothing could be written.
+    private func answerWithTheLastSnapshot(_ request: RefreshRequest, at stamp: SchedulerClock) -> Bool {
+        guard containerUsable(), var last = previous else { return false }
+        last.writerId = writerId
+        guard let outcome = try? SnapshotStore.writeNumbered(last, to: snapshotURL, after: lastWriteSequence) else { return false }
+        lastWriteSequence = outcome.sequence
+        last.writeSequence = outcome.sequence
+        if let id = outcome.writerId {
+            writerId = id
+            last.writerId = id
+        }
+        try? WriterStateStore.write(WriterState(lastSequence: outcome.sequence), in: directory)
+        previous = last
+        try? CappedLog.append("\(ISODate.format(stamp.wall)) refresh press within 30 s of the last; answered with the last snapshot",
+                              to: reloadLogURL, cap: SharedContainer.logCap)
+        if stamp.wall.timeIntervalSince(request.requestedAt) >= RefreshRequestStore.intentWait - RefreshRequestStore.intentPoll,
+           let candidate = completionCandidate(reloadState, current: DisplayFingerprint(last), stamp: stamp,
+                                               conservative: stateError != nil) {
+            if persistState(candidate.state) {
+                reloadState = candidate.state
+                reload()
+                let requests24h = candidate.state.requests.filter { stamp.seconds(since: $0) < ReloadScheduler.capWindow }.count
+                let status = last.provider(CswapListMapper.provider)?.status.rawValue ?? ProviderUsage.Status.error.rawValue
+                try? CappedLog.append(ReloadLog.line(at: stamp.wall, reasons: candidate.reasons, urgent: true, status: status,
+                                                     requests24h: requests24h, id: candidate.id, kind: .press),
+                                      to: reloadLogURL, cap: SharedContainer.logCap)
+            }
+        }
+        return true
+    }
+
+    /// Every save of the reload state goes through here: a save that works
+    /// records what is on disk and clears the error shown; one that fails
+    /// sets it (and the conservative mode with it).
+    @discardableResult
+    private func persistState(_ state: ReloadState) -> Bool {
+        do {
+            try saveState(state, reloadStateURL)
+            savedState = state
+            stateError = nil
+            return true
+        } catch {
+            stateError = "Reload state could not be saved: \(Redactor.redactEmails(error.localizedDescription))"
+            return false
+        }
+    }
+
+    /// The one check before anything is written: false once the agent has
+    /// stopped, and it stops when another folder now sits at the
+    /// container's path. A path that cannot be checked is logged once and
+    /// the anchor goes on being used.
+    private func containerUsable() -> Bool {
+        if stopped { return false }
+        switch ContainerRoot.revalidate(directory) {
+        case .replaced:
+            stopped = true
+            return false
+        case .refused(let reason):
+            if !loggedUncheckable {
+                loggedUncheckable = true
+                try? CappedLog.append("\(ISODate.format(clock().wall)) container path could not be checked: "
+                                      + Redactor.redactEmails(reason), to: reloadLogURL, cap: SharedContainer.logCap)
+            }
+        case .unchanged, .missing:
+            loggedUncheckable = false
+        }
+        return true
     }
 
     /// A press's completion reload, when its gates allow: under the cap, at
@@ -318,26 +404,15 @@ public actor UsageAgent {
     /// One poll. With `userRequested`, the reload that follows skips the
     /// spacing (it still counts toward the daily cap).
     public func tick(userRequested: Bool) async -> TickReport {
-        if stopped { return Self.stoppedReport(at: clock().wall) }
         // The container is anchored once at launch. Another folder at its
         // path stops the agent for good: no poll, no write into either
         // folder, nothing migrated. The app logs it and asks for a quit and
         // reopen; the lock on the old folder is simply kept.
-        switch ContainerRoot.revalidate(directory) {
-        case .replaced:
-            stopped = true
-            return Self.stoppedReport(at: clock().wall)
-        case .refused(let reason):
-            // The path cannot be checked, not a new folder: the anchor still
-            // works, so polling goes on; said once until it clears.
-            if !loggedUncheckable {
-                loggedUncheckable = true
-                try? CappedLog.append("\(ISODate.format(clock().wall)) container path could not be checked: "
-                                      + Redactor.redactEmails(reason), to: reloadLogURL, cap: SharedContainer.logCap)
-            }
-        case .unchanged, .missing:
-            loggedUncheckable = false
-        }
+        guard containerUsable() else { return Self.stoppedReport(at: clock().wall) }
+        // The press this poll answers. It is marked seen once a snapshot
+        // answering it is written; if the write fails it is pending again.
+        let taken = userRequested ? takenRequest : nil
+        takenRequest = nil
         if !loaded {
             // A restart keeps the last good accounts and the scheduler's memory.
             previous = SnapshotStore.read(from: snapshotURL)
@@ -372,12 +447,7 @@ public actor UsageAgent {
             // is saved straight back now; failing that counts like failing
             // to read it.
             if stateError == nil {
-                do {
-                    try saveState(reloadState, reloadStateURL)
-                    savedState = reloadState
-                } catch {
-                    stateError = "Reload state could not be saved: \(Redactor.redactEmails(error.localizedDescription))"
-                }
+                persistState(reloadState)
             }
             if stateError != nil {
                 // With no memory to trust, the launch itself counts as a
@@ -454,7 +524,7 @@ public actor UsageAgent {
             // The intent looks for the answer for 5 s, every 0.25 s. A
             // snapshot written within that sees its own unbudgeted reload,
             // so only a later one needs the completion reload.
-            let waited = takenRequest.map { now.timeIntervalSince($0.requestedAt) } ?? .infinity
+            let waited = taken.map { now.timeIntervalSince($0.requestedAt) } ?? .infinity
             if waited >= RefreshRequestStore.intentWait - RefreshRequestStore.intentPoll {
                 pressCandidate = completionCandidate(state, current: current, stamp: stamp, conservative: conservative)
             }
@@ -505,25 +575,15 @@ public actor UsageAgent {
         }
         // The completion reload fires only once its time is saved.
         if let pressCandidate {
-            do {
-                try saveState(pressCandidate.state, reloadStateURL)
+            if persistState(pressCandidate.state) {
                 state = pressCandidate.state
-                savedState = pressCandidate.state
                 fire = (pressCandidate.id, .press, pressCandidate.reasons, true)
-            } catch {
-                stateError = "Reload state could not be saved: \(Redactor.redactEmails(error.localizedDescription))"
             }
         }
 
         reloadState = state
         if state != savedState {
-            do {
-                try saveState(state, reloadStateURL)
-                savedState = state
-                stateError = nil
-            } catch {
-                stateError = "Reload state could not be saved: \(Redactor.redactEmails(error.localizedDescription))"
-            }
+            persistState(state)
         }
         let requests24h = state.requests.filter { stamp.seconds(since: $0) < ReloadScheduler.capWindow }.count
         report.budget = BudgetStatus(cap: ReloadScheduler.dailyCap, requests24h: requests24h,
