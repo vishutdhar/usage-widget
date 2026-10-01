@@ -179,6 +179,22 @@ final class RefreshPressTests: XCTestCase {
         XCTAssertNotEqual(wrapped.session, "S")
     }
 
+    /// The file an earlier build left (no session id) keeps an empty
+    /// session forever unless the intent replaces it: the next press
+    /// starts a new session at 1. This is the owner's file of Oct 1.
+    func testAnEmptySessionIsReplacedWithANewOne() throws {
+        let dir = try tempDir()
+        let owners = #"{"requestedAt":1790885010.281976,"session":"","afterWriter":"CF3BFB22-E232-4046-9BD8-943A073B5EB0","sequence":30,"afterSnapshot":4068}"#
+        try Data(owners.utf8).write(to: dir.appendingPathComponent(RefreshRequestStore.fileName))
+        XCTAssertEqual(RefreshRequestStore.read(in: dir)?.session, "")
+        let next = try RefreshRequestStore.request(in: dir, at: t0)
+        XCTAssertFalse(next.session.isEmpty)
+        XCTAssertEqual(next.sequence, 1)
+        let after = try RefreshRequestStore.request(in: dir, at: t0)
+        XCTAssertEqual(after.session, next.session, "then it goes on counting in the new session")
+        XCTAssertEqual(after.sequence, 2)
+    }
+
     /// A missing or damaged file starts a new session at number 1.
     func testANewFileStartsANewSession() throws {
         let dir = try tempDir()

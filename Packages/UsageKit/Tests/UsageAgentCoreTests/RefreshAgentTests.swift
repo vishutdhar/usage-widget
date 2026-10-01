@@ -310,6 +310,169 @@ final class RefreshAgentTests: XCTestCase {
         XCTAssertEqual(state(dir)?.requests.count, 2)
     }
 
+    /// Two presses 0.3 s apart (the owner's Oct 1 case): the second falls
+    /// inside the 30 s debounce. It is not ignored silently: the agent
+    /// answers it at once with the last snapshot under the next number,
+    /// runs no cswap, and logs one fixed line.
+    func testAPressInsideTheDebounceIsAnsweredFromTheLastSnapshot() async throws {
+        let dir = try makeTemporaryDirectory()
+        let clock = ManualClock(start)
+        let runner = ScriptedRunner([ok()])
+        let agent = UsageAgent(directory: dir, runner: runner, reload: {}, clock: { clock.stamp })
+        _ = await agent.tick()
+        clock.advance(60)
+        try RefreshRequestStore.request(in: dir, at: clock.now)
+        var taken = await agent.takeRefreshRequest()
+        XCTAssertTrue(taken)
+        _ = await agent.tick(userRequested: true)
+        let calls = runner.calls
+        clock.advance(0.3)
+        let second = try RefreshRequestStore.request(in: dir, at: clock.now)
+        taken = await agent.takeRefreshRequest()
+        XCTAssertFalse(taken, "inside the debounce: no second cswap run")
+        XCTAssertEqual(runner.calls, calls)
+        let outcome = await RefreshRequestStore.waitForAnswer(in: dir, to: second, timeout: 0.5)
+        XCTAssertEqual(outcome, .answered, "the intent sees an answer at once")
+        let log = try log(dir)
+        XCTAssertEqual(log.components(separatedBy: "refresh press within 30 s of the last; answered with the last snapshot").count - 1, 1)
+    }
+
+    /// A press inside the debounce after the container was replaced: the
+    /// answer goes through the same container check as a poll, so nothing
+    /// is written into either folder and the agent stops.
+    func testADebouncedAnswerAfterAReplacementWritesNothing() async throws {
+        let dir = try makeTemporaryDirectory()
+        let clock = ManualClock(start)
+        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp })
+        _ = await agent.tick()
+        clock.advance(60)
+        try RefreshRequestStore.request(in: dir, at: clock.now)
+        var taken = await agent.takeRefreshRequest()
+        XCTAssertTrue(taken)
+        _ = await agent.tick(userRequested: true)
+        // The second press reaches the old folder (this process's anchor), then
+        // another folder is put at the path.
+        try RefreshRequestStore.request(in: dir, at: clock.now)
+        let old = URL(fileURLWithPath: dir.path + ".old-\(UUID().uuidString)")
+        XCTAssertEqual(rename(dir.path, old.path), 0)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
+        let before = try String(contentsOf: old.appendingPathComponent("snapshot.json"), encoding: .utf8)
+        let logBefore = try String(contentsOf: old.appendingPathComponent(SharedContainer.agentLogFileName), encoding: .utf8)
+        clock.advance(1)
+        taken = await agent.takeRefreshRequest()
+        XCTAssertFalse(taken)
+        XCTAssertEqual(try String(contentsOf: old.appendingPathComponent("snapshot.json"), encoding: .utf8), before)
+        XCTAssertEqual(try String(contentsOf: old.appendingPathComponent(SharedContainer.agentLogFileName), encoding: .utf8),
+                       logBefore)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), [])
+        let report = await agent.tick()
+        XCTAssertTrue(report.containerChanged, "stopped")
+    }
+
+    /// A press whose answer cannot be written stays pending: the error
+    /// reaches the report, the next look tries again, and once writing
+    /// works the press is answered.
+    func testAPressWhoseAnswerCannotBeWrittenStaysPending() async throws {
+        let dir = try makeTemporaryDirectory()
+        let clock = ManualClock(start)
+        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp })
+        _ = await agent.tick()
+        let snapshot = dir.appendingPathComponent("snapshot.json")
+        try FileManager.default.removeItem(at: snapshot)
+        try FileManager.default.createDirectory(at: snapshot, withIntermediateDirectories: false)
+        clock.advance(60)
+        let request = try RefreshRequestStore.request(in: dir, at: clock.now)
+        var taken = await agent.takeRefreshRequest()
+        XCTAssertTrue(taken)
+        let failed = await agent.tick(userRequested: true)
+        XCTAssertNotNil(failed.writeError, "the status window shows why")
+        clock.advance(2)
+        taken = await agent.takeRefreshRequest()
+        XCTAssertFalse(taken, "inside the debounce: a cheap try, not another cswap run")
+        try FileManager.default.removeItem(at: snapshot)
+        clock.advance(2)
+        taken = await agent.takeRefreshRequest()
+        XCTAssertFalse(taken)
+        let outcome = await RefreshRequestStore.waitForAnswer(in: dir, to: request, timeout: 0.5)
+        XCTAssertEqual(outcome, .answered, "still pending until a write worked, then answered")
+    }
+
+    /// A press inside the debounce noticed late (the loop was held 6 s): the
+    /// intent's own reload already showed the unanswered snapshot, so the
+    /// answer brings one counted completion reload. Noticed in time, none.
+    func testALateDebouncedAnswerBringsTheCompletionReload() async throws {
+        for (late, expected) in [(6.0, 1), (1.0, 0)] {
+            let dir = try makeTemporaryDirectory()
+            let clock = ManualClock(start)
+            let reloads = Counter()
+            let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: { reloads.increment() },
+                                   clock: { clock.stamp })
+            _ = await agent.tick()
+            clock.advance(11 * 60)
+            try RefreshRequestStore.request(in: dir, at: clock.now)
+            var taken = await agent.takeRefreshRequest()
+            XCTAssertTrue(taken)
+            _ = await agent.tick(userRequested: true)
+            let before = reloads.count
+            try RefreshRequestStore.request(in: dir, at: clock.now)
+            clock.advance(late)
+            taken = await agent.takeRefreshRequest()
+            XCTAssertFalse(taken)
+            XCTAssertEqual(reloads.count - before, expected, "noticed \(late) s after the press")
+            if expected == 1 {
+                let last = try XCTUnwrap(try log(dir).split(separator: "\n").last)
+                XCTAssertTrue(last.contains("kind=press"), String(last))
+            }
+        }
+    }
+
+    /// Saves failed long enough for the status window to show it; storage
+    /// recovers and the first save to work is a late debounced press's.
+    /// That save clears the error, as any successful save does.
+    func testASuccessfulSaveOnTheDebouncedPathClearsTheStateError() async throws {
+        let dir = try makeTemporaryDirectory()
+        let clock = ManualClock(start)
+        let saver = FlakySaver()
+        saver.failing = true
+        let reloads = Counter()
+        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: { reloads.increment() },
+                               clock: { clock.stamp }, saveState: saver.save)
+        let failing = await agent.tick()
+        XCTAssertNotNil(failing.stateError)
+        clock.advance(61 * 60)
+        try RefreshRequestStore.request(in: dir, at: clock.now)
+        let taken = await agent.takeRefreshRequest()
+        XCTAssertTrue(taken)
+        let quick = await agent.tick(userRequested: true)
+        XCTAssertNotNil(quick.stateError, "still failing")
+        saver.failing = false
+        try RefreshRequestStore.request(in: dir, at: clock.now)
+        clock.advance(6)
+        let second = await agent.takeRefreshRequest()
+        XCTAssertFalse(second)
+        XCTAssertEqual(reloads.count, 1, "the late answer's completion reload, saved first")
+        clock.advance(1)
+        let report = await agent.tick()
+        XCTAssertNil(report.stateError, "the save that worked cleared it")
+    }
+
+    /// An agent that finds the owner's Oct 1 request file at launch treats
+    /// it as old, and takes the next press, which comes in a new session.
+    func testTheOwnersRequestFileDoesNotBlockTheNextPress() async throws {
+        let dir = try makeTemporaryDirectory()
+        let owners = #"{"requestedAt":1790885010.281976,"session":"","afterWriter":"CF3BFB22-E232-4046-9BD8-943A073B5EB0","sequence":30,"afterSnapshot":4068}"#
+        try Data(owners.utf8).write(to: dir.appendingPathComponent(RefreshRequestStore.fileName))
+        let clock = ManualClock(start)
+        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp })
+        _ = await agent.tick()
+        var taken = await agent.takeRefreshRequest()
+        XCTAssertFalse(taken, "made before launch")
+        clock.advance(60)
+        try RefreshRequestStore.request(in: dir, at: clock.now)
+        taken = await agent.takeRefreshRequest()
+        XCTAssertTrue(taken, "the next press is taken")
+    }
+
     /// A press the poll's snapshot does not answer (made after that write)
     /// is left for the loop to take.
     func testAPressNotAnsweredByThePollIsLeftToTake() async throws {
