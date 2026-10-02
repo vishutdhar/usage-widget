@@ -15,8 +15,13 @@ final class TimeTextTests: XCTestCase {
     }
 
     func testAnotherDayAddsTheDate() {
+        XCTAssertEqual(TimeText.moment(utc(2026, 9, 25, 10, 0, 0), relativeTo: now, locale: posix, timeZone: utcZone,
+                                       calendar: gregorian), "Sep 25 at 10:00\u{202F}AM")
+    }
+
+    func testTheDayBeforeSaysYesterday() {
         XCTAssertEqual(TimeText.moment(utc(2026, 9, 26, 10, 0, 0), relativeTo: now, locale: posix, timeZone: utcZone,
-                                       calendar: gregorian), "Sep 26 at 10:00\u{202F}AM")
+                                       calendar: gregorian), "10:00\u{202F}AM yesterday")
     }
 
     func testTheCallersLocaleAndTimeZoneAreUsed() {
@@ -31,7 +36,7 @@ final class TimeTextTests: XCTestCase {
     func testNoteLines() {
         XCTAssertEqual(TimeText.noteLine("Log in again", lastKnownAt: utc(2026, 9, 26, 10, 0, 0), relativeTo: now,
                                          locale: posix, timeZone: utcZone, calendar: gregorian),
-                       "Log in again, last known as of Sep 26 at 10:00\u{202F}AM")
+                       "Log in again, last known as of 10:00\u{202F}AM yesterday")
         XCTAssertEqual(TimeText.noteLine("Keychain locked", lastKnownAt: nil, relativeTo: now,
                                          locale: posix, timeZone: utcZone, calendar: gregorian),
                        "Keychain locked")

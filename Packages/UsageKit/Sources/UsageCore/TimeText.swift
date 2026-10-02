@@ -12,9 +12,18 @@ public enum TimeText {
         let time = Date.FormatStyle(date: .omitted, time: .shortened, locale: locale, calendar: calendar,
                                     timeZone: timeZone)
         if calendar.isDate(date, inSameDayAs: now) { return date.formatted(time) }
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: now), calendar.isDate(date, inSameDayAs: yesterday) {
+            return date.formatted(time) + " yesterday"
+        }
         let dated = Date.FormatStyle(locale: locale, calendar: calendar, timeZone: timeZone)
             .month(.abbreviated).day().hour().minute()
         return date.formatted(dated)
+    }
+
+    /// "stale · as of 7:08 PM yesterday": numbers past their line.
+    public static func staleLine(since date: Date, relativeTo now: Date, locale: Locale, timeZone: TimeZone,
+                                 calendar: Calendar) -> String {
+        "stale \u{00B7} " + asOf(date, relativeTo: now, locale: locale, timeZone: timeZone, calendar: calendar)
     }
 
     /// "as of 10:04 AM": always true of the numbers on screen.

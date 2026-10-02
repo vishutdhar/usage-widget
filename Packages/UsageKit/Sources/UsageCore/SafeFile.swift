@@ -344,6 +344,28 @@ public enum SafeFile {
 
     /// Opens (creating when missing) a lock file for flock: never through a
     /// link, and only a regular single-link file. -1 with errno set otherwise.
+    /// Writes the lock holder's pid into the agent lock, on the locked
+    /// descriptor itself (the inode the lock is on). Nil, or the error.
+    public static func publishLockHolder(_ fd: Int32, pid: Int32) -> String? {
+        if let error = clearLockHolder(fd) { return error }
+        let bytes = Array("\(pid)".utf8)
+        let written = bytes.withUnsafeBytes { pwrite(fd, $0.baseAddress, $0.count, 0) }
+        guard written == bytes.count else { return written < 0 ? String(cString: strerror(errno)) : "short write" }
+        return nil
+    }
+
+    /// The pid in the agent lock, read on a descriptor of that file; nil
+    /// when none was written (or it was cleared).
+    public static func readLockHolder(_ fd: Int32) -> Int32? {
+        guard let data = readRange(fd, offset: 0, count: 32) else { return nil }
+        return Int32(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// Empties the agent lock before its holder lets go. Nil, or the error.
+    public static func clearLockHolder(_ fd: Int32) -> String? {
+        ftruncate(fd, 0) == 0 ? nil : String(cString: strerror(errno))
+    }
+
     public static func openLock(_ url: URL) -> Int32 {
         guard case .success(let place) = place(url) else {
             errno = EACCES

@@ -5,6 +5,9 @@ import UsageAgentCore
 /// Codex is shown, and whether it starts at login.
 struct StatusView: View {
     let controller: AgentController
+    /// Stop asks first: a stray click (or an automated one) must not stop
+    /// the agent, which launchd would otherwise not bring back.
+    @State private var confirmingStop = false
 
     var body: some View {
         Form {
@@ -95,6 +98,19 @@ struct StatusView: View {
                     get: { controller.loginItemStatus == .enabled },
                     set: { controller.setStartAtLogin($0) }
                 ))
+                Text("While on, Usage Widget also restarts after a crash. Turning it off stops Usage Widget now.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                if let note = controller.loginItemNote {
+                    Text(note)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                if let note = controller.supervisionNote {
+                    Text(note)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
                 if controller.loginItemStatus == .requiresApproval {
                     Text("Allow Usage Widget in System Settings, General, Login Items.")
                         .font(.callout)
@@ -113,7 +129,14 @@ struct StatusView: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Button("Quit") { NSApp.terminate(nil) }
+                    Button("Stop\u{2026}") { confirmingStop = true }
+                }
+                .confirmationDialog("Stop Usage Widget until you open it again or log in?",
+                                    isPresented: $confirmingStop) {
+                    Button("Stop", role: .destructive) { controller.stop() }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("The widget stops updating.")
                 }
             }
         }

@@ -174,7 +174,7 @@ public enum CodexMerge {
             var kept = AccountUsage(id: "codex", label: "Codex", active: false, fetchedAt: newest.measuredAt,
                                     windows: newest.windows, status: fresh ? .ok : .stale,
                                     statusNote: fresh ? nil : "No new reading")
-            // The age on the continuous clock, so the widget dims by it
+            // The age on the continuous clock, so the widget judges staleness by it
             // rather than by the wall clock.
             kept.ageSeconds = newest.observedAge
             account = kept

@@ -2,13 +2,13 @@ import SwiftUI
 import UsageCore
 
 /// One rounded 6 pt bar: a quiet track, a band-coloured fill, and the pace
-/// tick where on-schedule usage would be. An unknown value draws no bar; a
-/// dimmed one (numbers not current) fills in a secondary colour.
+/// tick where on-schedule usage would be. An unknown value draws no bar.
+/// The fill keeps its band colour whatever the age of the numbers; old
+/// numbers say so in words beside the account.
 struct UsageBar: View {
     let fraction: Double
     let level: UsageLevel
     let paceFraction: Double?
-    var dimmed = false
 
     var body: some View {
         if level == .unknown {
@@ -25,7 +25,7 @@ struct UsageBar: View {
             ZStack(alignment: .leading) {
                 Capsule().fill(Color(nsColor: .quaternaryLabelColor))
                 if fill > 0 {
-                    Capsule().fill(dimmed ? Color(nsColor: .secondaryLabelColor) : level.fillColor).frame(width: fill)
+                    Capsule().fill(level.fillColor).frame(width: fill)
                 }
                 if let paceFraction {
                     RoundedRectangle(cornerRadius: BarGeometry.tickWidth / 2)

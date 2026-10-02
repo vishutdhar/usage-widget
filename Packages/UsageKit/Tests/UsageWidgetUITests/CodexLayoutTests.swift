@@ -131,12 +131,26 @@ final class CodexLayoutTests: XCTestCase {
         let yesterday = entry.addingTimeInterval(-26 * 3600)
         XCTAssertEqual(trailing(account("Log in again", lastKnown: yesterday)),
                        TimeText.asOf(yesterday, relativeTo: entry, locale: english, timeZone: utc, calendar: calendar))
-        XCTAssertTrue(trailing(account("Log in again", lastKnown: yesterday))?.contains("Sep 26") ?? false)
+        XCTAssertTrue(trailing(account("Log in again", lastKnown: yesterday))?.hasSuffix("yesterday") ?? false)
+        let twoDays = entry.addingTimeInterval(-50 * 3600)
+        XCTAssertTrue(trailing(account("Log in again", lastKnown: twoDays))?.contains("Sep 25") ?? false)
         XCTAssertNil(trailing(account(nil, lastKnown: nil)), "current numbers need no note")
+        var stale = account(nil, lastKnown: nil)
+        stale.staleSince = fiveAgo
+        XCTAssertEqual(trailing(stale), "stale \u{00B7} " + (today ?? ""), "current but old numbers say stale")
         XCTAssertEqual(trailing(account("Token expired", lastKnown: nil)), "Token expired", "no time known: the note")
     }
 
     /// The footer says "Refreshing…" while a press is answered, else "as of".
+    /// A widget whose agent stopped says so, unless a press is being
+    /// answered.
+    func testTheNotUpdatingFooter() {
+        XCTAssertEqual(AsOfLine.text(date: entry, footer: .none, now: entry, locale: english, timeZone: utc,
+                                     calendar: calendar, notUpdating: true), "Not updating; open Usage Widget")
+        XCTAssertEqual(AsOfLine.text(date: entry, footer: .refreshing, now: entry, locale: english, timeZone: utc,
+                                     calendar: calendar, notUpdating: true), "Refreshing\u{2026}")
+    }
+
     func testTheFooterText() {
         XCTAssertEqual(AsOfLine.text(date: entry, footer: .refreshing, now: entry, locale: english, timeZone: utc,
                                      calendar: calendar), "Refreshing\u{2026}")

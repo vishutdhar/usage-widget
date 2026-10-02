@@ -1,12 +1,18 @@
 #!/bin/bash
-# Installs the Release build to ~/Applications and launches it. The app
-# registers itself as a login item on its first launch.
+# Installs the Release build to ~/Applications and opens it. Opening
+# registers the app's launchd job (start at login, restart after a crash)
+# and hands the agent to it. Scripts/test-install.sh runs this with stubs;
+# the USAGE_WIDGET_* variables are for that test.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUILT="$ROOT/build/DerivedData/Build/Products/Release/Usage Widget.app"
-DEST="$HOME/Applications/Usage Widget.app"
+BUILT="${USAGE_WIDGET_BUILT:-$ROOT/build/DerivedData/Build/Products/Release/Usage Widget.app}"
+DEST="${USAGE_WIDGET_DEST:-$HOME/Applications/Usage Widget.app}"
+LSREGISTER="${USAGE_WIDGET_LSREGISTER:-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister}"
+VERIFY_TRIES="${USAGE_WIDGET_VERIFY_TRIES:-40}"
+STOP_TRIES="${USAGE_WIDGET_STOP_TRIES:-50}"
 BUNDLE_ID="com.vishutdhar.usagewidget"
-LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+EXE="Contents/MacOS/Usage Widget"
+JOB="gui/$(id -u)/com.vishutdhar.usagewidget.agent"
 
 [ -d "$BUILT" ] || { echo "No build found. Run Scripts/build.sh first." >&2; exit 1; }
 
@@ -14,14 +20,28 @@ is_running() {
     [ "$(osascript -e "application id \"$BUNDLE_ID\" is running")" = "true" ]
 }
 
-# Quit the running copy by bundle id, and wait for it to exit.
+wait_until_stopped() {
+    for _ in $(seq 1 "$STOP_TRIES"); do is_running || return 0; sleep 0.2; done
+    return 1
+}
+
+# Only mechanisms every earlier build supports, since the old executable
+# may know none of today's flags (running it with one would start it).
+# The job first: bootout stops launchd's copy and keeps KeepAlive from
+# starting it again ("not found" when there is no job is fine).
+launchctl bootout "$JOB" >/dev/null 2>&1 || true
+# Then a copy outside launchd: the new executable's --stop reaches builds
+# that have Stop; any other ends by its exact executable path.
+. "$ROOT/Scripts/kill-extension.sh"
 if is_running; then
-    osascript -e "tell application id \"$BUNDLE_ID\" to quit"
-    for _ in $(seq 1 50); do is_running || break; sleep 0.2; done
-    if is_running; then echo "Usage Widget did not quit; quit it and run this again." >&2; exit 1; fi
+    "$BUILT/$EXE" --stop
+    if ! wait_until_stopped; then
+        kill_exact_executable "$DEST/$EXE"
+        wait_until_stopped || { echo "Usage Widget did not stop; stop it and run this again." >&2; exit 1; }
+    fi
 fi
 
-mkdir -p "$HOME/Applications"
+mkdir -p "$(dirname "$DEST")"
 rm -rf "$DEST"
 ditto "$BUILT" "$DEST"
 
@@ -40,8 +60,41 @@ pluginkit -a "$DEST/$APPEX"
 # A widget extension already running keeps the old code until it exits;
 # end that process (matched by its exact installed executable path, as a
 # plain string) so WidgetKit starts the new one on the next reload.
-. "$ROOT/Scripts/kill-extension.sh"
 kill_exact_executable "$DEST/$APPEX/Contents/MacOS/UsageWidgetExtension"
 
+# A replaced app's job must be registered again: the new executable does
+# it, keeping the person's Start at login choice (exit 3 when left off or
+# awaiting approval, 4 when registration failed). Opening then shows the
+# status window (launchd's copy, or this copy when the job cannot run).
+REGISTERED=true
+REGISTER_STATUS=0
+"$DEST/$EXE" --register-job || REGISTER_STATUS=$?
+case "$REGISTER_STATUS" in
+    0) ;;
+    3) REGISTERED=false ;;
+    *) echo "Installed, but registering the launchd job failed (status $REGISTER_STATUS); see above." >&2
+       exit 1 ;;
+esac
 open "$DEST"
-echo "Installed and launched: $DEST"
+
+# launchd must now run the installed executable: the job's process has
+# that very file (same inode) open as its program text.
+job_runs_installed_copy() {
+    local pid inode
+    pid="$(launchctl print "$JOB" 2>/dev/null | awk '/^\tpid = /{print $3}')"
+    [ -n "$pid" ] || return 1
+    inode="$(stat -f %i "$DEST/$EXE")"
+    lsof -a -p "$pid" -d txt -Fi 2>/dev/null | grep -qx "i$inode"
+}
+for _ in $(seq 1 "$VERIFY_TRIES"); do
+    if job_runs_installed_copy; then
+        echo "Installed; launchd runs it: $DEST"
+        exit 0
+    fi
+    sleep 0.5
+done
+if [ "$REGISTERED" = true ]; then
+    echo "Installed, but launchd is not running the new copy; see its status window." >&2
+    exit 1
+fi
+echo "Installed and opened without launchd (Start at login is off or awaits approval): $DEST"

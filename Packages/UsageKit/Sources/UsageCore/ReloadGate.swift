@@ -22,7 +22,7 @@ public enum ReloadReason: String, Codable, Sendable, CaseIterable {
     case resetMoved = "reset-moved"
     /// A spend window's amount or limit text changed.
     case spend
-    /// The numbers the widget shows will pass the two hour dimming line
+    /// The numbers the widget shows will pass the two hour stale line
     /// within the next poll, and newer numbers exist.
     case aging
     /// A provider detail the widget shows changed: the plan, or the count
@@ -162,10 +162,10 @@ public enum ReloadGate {
     /// How often the agent polls: the aging rule looks this far ahead.
     public static let pollInterval: TimeInterval = 60
 
-    /// The shown numbers pass the dimming line before the next poll, and
+    /// The shown numbers pass the stale line before the next poll, and
     /// newer numbers exist to replace them. When the shown measurement time
     /// is unknown (a fingerprint from a build that did not record it), the
-    /// widget may already be dimming the account, so any numbers still
+    /// widget may already mark the account stale, so any numbers still
     /// short of the line are worth one ordinary reload.
     static func aging(shown: Date?, available: Date?, now: Date, line: TimeInterval = Staleness.dimAfter) -> Bool {
         guard let available else { return false }

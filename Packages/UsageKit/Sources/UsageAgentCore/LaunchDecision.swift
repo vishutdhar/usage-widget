@@ -8,6 +8,9 @@ public enum LaunchAction: Equatable, Sendable {
     case handOverAndExit
     /// A login launch found a copy already running: quit without a window.
     case exitQuietly
+    /// launchd's copy found another copy holding the lock after waiting:
+    /// leave with a non-zero status, so KeepAlive tries again.
+    case leaveForRetry
     /// The lock itself failed: stay open with the reason shown, without polling.
     case stayWithoutPolling(String)
 }
@@ -17,11 +20,13 @@ public enum LaunchAction: Equatable, Sendable {
 public enum LaunchDecision {
     /// The login check comes before the handover: a duplicate login launch
     /// must not open the running copy's window.
-    public static func decide(lock: InstanceLock.Outcome.Kind, loginLaunch: Bool) -> LaunchAction {
+    public static func decide(lock: InstanceLock.Outcome.Kind, loginLaunch: Bool,
+                              startedByLaunchd: Bool = false) -> LaunchAction {
         switch lock {
         case .acquired:
             return .run
         case .heldElsewhere:
+            if startedByLaunchd { return .leaveForRetry }
             return loginLaunch ? .exitQuietly : .handOverAndExit
         case .failed(let reason):
             return .stayWithoutPolling("Could not take the agent lock: \(Redactor.redactEmails(reason))")

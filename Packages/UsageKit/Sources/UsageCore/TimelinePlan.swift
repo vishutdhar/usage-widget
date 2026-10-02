@@ -19,7 +19,7 @@ public enum TimelinePlan {
 
     /// Entries for one timeline: now, then the end of each 5 minute bucket
     /// that holds a reset or the moment an account's numbers pass the two
-    /// hour dimming line, at most `maxBuckets` of them.
+    /// hour stale line, at most `maxBuckets` of them.
     /// The plan, plus an entry where a pending refresh's "Refreshing…"
     /// runs out, so the footer goes back to "as of" on time.
     public static func plan(for snapshot: UsageSnapshot?, now: Date, refresh: RefreshRequest?) -> Plan {
@@ -38,7 +38,7 @@ public enum TimelinePlan {
         let end = now.addingTimeInterval(horizon)
         let shown = snapshot.providers.filter { !$0.hidden }
         let accounts = shown.flatMap(\.accounts)
-        // Each account dims at its provider's line.
+        // Each account turns stale at its provider's line.
         let dimMoments = shown.flatMap { provider in
             provider.accounts.filter { !$0.windows.isEmpty }.compactMap {
                 Staleness.dimMoment($0, writtenAt: snapshot.writtenAt, provider: provider.provider)
