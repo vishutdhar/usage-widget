@@ -38,7 +38,7 @@ final class AgentController {
     @ObservationIgnored private var agent: UsageAgent?
     @ObservationIgnored private var loop: Task<Void, Never>?
     @ObservationIgnored private var activity: NSObjectProtocol?
-    @ObservationIgnored private let loginItems = LoginItemManager(service: SystemLoginItem())
+    @ObservationIgnored private let loginItems = AgentController.makeLoginItems()
     func start() {
         // Registers on the first launch, and retries on later launches until
         // that has worked once; after that the toggle decides.
@@ -74,9 +74,13 @@ final class AgentController {
             reason: "Refreshes usage for the desktop widget every minute"
         )
 
-        // One loop, so polls never overlap: a poll every minute, and every
-        // two seconds a look for a press of the widget's refresh button,
-        // which polls at once.
+        startLoop()
+    }
+
+    /// One loop, so polls never overlap: a poll every minute, and every
+    /// two seconds a look for a press of the widget's refresh button,
+    /// which polls at once.
+    private func startLoop() {
         loop = Task { [weak self] in
             let clock = ContinuousClock()
             var next = clock.now
@@ -92,6 +96,21 @@ final class AgentController {
                 try? await Task.sleep(for: Self.refreshCheck)
             }
         }
+    }
+
+    /// Stops polling and waits for a poll under way to finish: a copy
+    /// handing the agent over lets go of the lock only after this.
+    func pausePolling() async {
+        let running = loop
+        loop = nil
+        running?.cancel()
+        await running?.value
+    }
+
+    /// Polls again after a handover that did not happen.
+    func resumePolling() {
+        guard loop == nil, agent != nil else { return }
+        startLoop()
     }
 
     /// The agent lock failed: keep the login item in order and show why,
@@ -179,16 +198,75 @@ final class AgentController {
         Task { await agent.setCodex(enabled ? Self.makeCollector() : nil) }
     }
 
+    // MARK: stopping
+
+    /// Set by the app delegate: ends the app as a confirmed Stop.
+    @ObservationIgnored var stopHandler: (() -> Void)?
+    /// Set by the app delegate: Start at login was changed here.
+    @ObservationIgnored var loginItemChanged: (() -> Void)?
+    /// Why this copy runs the agent without launchd's supervision, if it does.
+    var supervisionNote: String?
+    /// A note about the person's Start at login choice, if any.
+    private(set) var loginItemNote: String?
+
+    /// Stop, confirmed in the status window.
+    func stop() {
+        stopHandler?()
+    }
+
     // MARK: login item
 
+    /// `Usage Widget --start-at-login on|off`: the status window's toggle
+    /// from a terminal, printing the job's status after.
+    nonisolated static let startAtLoginFlag = "--start-at-login"
+
+    nonisolated static func startAtLoginChoice(from arguments: [String]) -> Bool? {
+        guard let index = arguments.firstIndex(of: startAtLoginFlag), index + 1 < arguments.endIndex else { return nil }
+        switch arguments[index + 1] {
+        case "on": return true
+        case "off": return false
+        default: return nil
+        }
+    }
+
+    nonisolated static func setStartAtLoginFromCommandLine(_ enabled: Bool) -> Int32 {
+        let manager = makeLoginItems()
+        if manager.setEnabled(enabled) == .stopTheApp {
+            // As the toggle does: the running copy, whichever it is, stops.
+            DistributedNotificationCenter.default().postNotificationName(
+                Notification.Name(LaunchAgentJob.stopNotification), object: nil, userInfo: nil,
+                deliverImmediately: true)
+        }
+        print("Start at login: \(manager.status)")
+        if let error = manager.lastError {
+            FileHandle.standardError.write(Data("\(error)\n".utf8))
+            return 1
+        }
+        return 0
+    }
+
+    nonisolated static func makeLoginItems() -> LoginItemManager {
+        LoginItemManager(service: SystemLoginItem(.agent(plistName: LaunchAgentJob.plistName)),
+                         legacy: SystemLoginItem(.mainApp))
+    }
+
     func setStartAtLogin(_ enabled: Bool) {
-        loginItems.setEnabled(enabled)
+        let outcome = loginItems.setEnabled(enabled)
         refreshLoginItemStatus()
+        if outcome == .stopTheApp {
+            // Off means nothing runs: launchd ends its own copy as the job
+            // goes, and any copy (one running unsupervised too) stops here.
+            Log.agent.info("Start at login turned off; stopping")
+            stopHandler?()
+            return
+        }
+        loginItemChanged?()
     }
 
     func refreshLoginItemStatus() {
         loginItemStatus = loginItems.status
         loginItemError = loginItems.lastError
+        loginItemNote = loginItems.note
         Log.agent.info("login item status: \(String(describing: self.loginItemStatus), privacy: .public)")
         if let error = loginItemError {
             Log.agent.error("login item error: \(error, privacy: .private)")
@@ -196,10 +274,18 @@ final class AgentController {
     }
 }
 
-/// SMAppService.mainApp behind the tested `LoginItemService` protocol.
+/// An SMAppService registration behind the tested `LoginItemService`
+/// protocol: the agent's launchd job, or the app login item earlier builds
+/// registered.
 final class SystemLoginItem: LoginItemService {
+    private let service: SMAppService
+
+    init(_ service: SMAppService) {
+        self.service = service
+    }
+
     var status: LoginItemStatus {
-        switch SMAppService.mainApp.status {
+        switch service.status {
         case .enabled: return .enabled
         case .requiresApproval: return .requiresApproval
         case .notFound: return .notFound
@@ -208,10 +294,10 @@ final class SystemLoginItem: LoginItemService {
     }
 
     func register() throws {
-        try SMAppService.mainApp.register()
+        try service.register()
     }
 
     func unregister() throws {
-        try SMAppService.mainApp.unregister()
+        try service.unregister()
     }
 }

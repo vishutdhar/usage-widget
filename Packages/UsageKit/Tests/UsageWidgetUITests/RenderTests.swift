@@ -103,6 +103,38 @@ final class RenderTests: XCTestCase {
         }
     }
 
+    /// The overnight case: every account measured hours ago and the agent
+    /// not running. The bars keep their usage colours; each account says it
+    /// is stale and when it was measured; the footer says the widget is not
+    /// updating.
+    func testStaleNumbersKeepTheirColours() throws {
+        var accounts = sampleAccounts()
+        for i in accounts.indices { accounts[i].fetchedAt = Self.entryDate.addingTimeInterval(-16 * 3600) }
+        var snap = snapshot(accounts)
+        snap.writtenAt = Self.entryDate.addingTimeInterval(-16 * 3600)
+        let c = WidgetContent.make(snapshot: snap, at: Self.entryDate, refresh: nil, checkedAt: Self.entryDate)
+        XCTAssertTrue(c.notUpdating)
+        XCTAssertTrue(c.sections[0].accounts.allSatisfy { $0.staleSince != nil })
+        for scheme in [ColorScheme.light, .dark] {
+            try render(c, .medium, scheme, "medium-stale")
+            try render(c, .large, scheme, "large-stale")
+        }
+    }
+
+    /// Old numbers from an agent still writing: the footer dates them,
+    /// "as of 8:00 PM yesterday", and the bars keep their colours.
+    func testOldNumbersFromARunningAgentAreDatedInTheFooter() throws {
+        var accounts = sampleAccounts()
+        for i in accounts.indices { accounts[i].fetchedAt = Self.entryDate.addingTimeInterval(-16 * 3600) }
+        var snap = snapshot(accounts)
+        snap.writtenAt = Self.entryDate.addingTimeInterval(-60)
+        let c = WidgetContent.make(snapshot: snap, at: Self.entryDate, refresh: nil, checkedAt: Self.entryDate)
+        XCTAssertFalse(c.notUpdating)
+        for scheme in [ColorScheme.light, .dark] {
+            try render(c, .medium, scheme, "medium-stale-running")
+        }
+    }
+
     /// Without RENDER_DIR or APPROVE_RENDERS, PNGs go to a temporary folder,
     /// never into the repository.
     func testPlainRunsWriteRendersOutsideTheRepository() throws {

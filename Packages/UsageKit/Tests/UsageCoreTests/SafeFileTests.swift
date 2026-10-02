@@ -287,6 +287,49 @@ final class SafeFileTests: XCTestCase {
         XCTAssertTrue(text.contains("--- snapshot.json\n(refused"), text)
     }
 
+    /// The agent lock's holder pid goes through SafeFile on the locked
+    /// descriptor itself: published, read back by a probe, and cleared.
+    func testTheLockHolderPidIsWrittenReadAndClearedOnTheLockedFile() throws {
+        let url = try tempDir().appendingPathComponent("agent.lock")
+        let fd = SafeFile.openLock(url)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { close(fd) }
+        XCTAssertNil(SafeFile.publishLockHolder(fd, pid: 4321))
+        XCTAssertEqual(SafeFile.readLockHolder(fd), 4321)
+        XCTAssertNil(SafeFile.publishLockHolder(fd, pid: 7), "a shorter pid replaces a longer one whole")
+        XCTAssertEqual(SafeFile.readLockHolder(fd), 7)
+        XCTAssertNil(SafeFile.clearLockHolder(fd))
+        XCTAssertNil(SafeFile.readLockHolder(fd))
+    }
+
+    /// A pid that cannot be written is an error to log, not silence.
+    func testAPidThatCannotBePublishedIsAnError() throws {
+        let url = try tempDir().appendingPathComponent("agent.lock")
+        XCTAssertGreaterThanOrEqual(SafeFile.openLock(url), 0)
+        let readOnly = try XCTUnwrap(FileHandle(forReadingAtPath: url.path))
+        defer { try? readOnly.close() }
+        XCTAssertNotNil(SafeFile.publishLockHolder(readOnly.fileDescriptor, pid: 1))
+    }
+
+    /// The write itself failing (here: a zero file size limit, which lets
+    /// the file be emptied but not written) is reported too.
+    func testAFailedPidWriteIsAnError() throws {
+        let url = try tempDir().appendingPathComponent("agent.lock")
+        let fd = SafeFile.openLock(url)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { close(fd) }
+        var saved = rlimit()
+        XCTAssertEqual(getrlimit(RLIMIT_FSIZE, &saved), 0)
+        let oldHandler = signal(SIGXFSZ, SIG_IGN)
+        var zero = saved
+        zero.rlim_cur = 0
+        XCTAssertEqual(setrlimit(RLIMIT_FSIZE, &zero), 0)
+        let error = SafeFile.publishLockHolder(fd, pid: 4321)
+        XCTAssertEqual(setrlimit(RLIMIT_FSIZE, &saved), 0)
+        signal(SIGXFSZ, oldHandler)
+        XCTAssertNotNil(error)
+    }
+
     /// No file is opened, read or written anywhere else: every such call
     /// in the package, the app and the widget sits in these files.
     func testFileAccessGoesThroughSafeFileOnly() throws {
@@ -295,7 +338,7 @@ final class SafeFileTests: XCTestCase {
         let repo = root.deletingLastPathComponent().deletingLastPathComponent()
         let folders = [root.appendingPathComponent("Sources"), repo.appendingPathComponent("App"),
                        repo.appendingPathComponent("Widget")]
-        let pattern = /Data\(contentsOf|String\(contentsOf|FileHandle\(|\.createFile\(|fopen\(|(^|[^A-Za-z0-9_])open\(|openat\(|renameat\(|unlinkat\(|\.write\(to:/
+        let pattern = /Data\(contentsOf|String\(contentsOf|FileHandle\(|\.createFile\(|fopen\(|(^|[^A-Za-z0-9_])open\(|openat\(|renameat\(|unlinkat\(|\.write\(to:|pread\(|pwrite\(|ftruncate\(/
         let allowed: Set<String> = ["SafeFile.swift"]
         var found: [String] = []
         for folder in folders {

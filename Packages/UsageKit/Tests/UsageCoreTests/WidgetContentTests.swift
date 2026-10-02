@@ -81,7 +81,7 @@ final class WidgetContentTests: XCTestCase {
         }
         XCTAssertEqual(lines, [
             "1 lit -",
-            "2 dim Log in again, last known as of Sep 26 at 10:00\u{202F}AM",
+            "2 dim Log in again, last known as of 10:00\u{202F}AM yesterday",
             "3 lit No saved login",
             "4 dim Token expired, last known as of 8:00\u{202F}AM",
             "5 lit Keychain locked",

@@ -1,7 +1,7 @@
 import Foundation
 
 /// How old a provider's numbers may get before they count as stale: the
-/// widget dims them, the timeline plans the moment, and a Codex account
+/// widget marks them stale, the timeline plans the moment, and a Codex account
 /// turns stale. Each line matches how often the provider is refreshed.
 public enum Staleness {
     /// cswap refreshes every few minutes.

@@ -24,6 +24,33 @@ final class InstanceLockTests: XCTestCase {
         XCTAssertEqual(InstanceLock.acquire(at: url).kind, .heldElsewhere)
     }
 
+    /// The holder writes its pid into the lock file, so a copy handing over
+    /// can see which process took the lock; a probe never keeps it.
+    func testAProbeSeesTheHoldersPidAndNeverKeepsTheLock() throws {
+        let url = try temporaryDirectory().appendingPathComponent("agent.lock")
+        XCTAssertEqual(InstanceLock.probe(at: url), .free)
+        XCTAssertEqual(InstanceLock.probe(at: url), .free, "the first probe let go")
+        let lock = try XCTUnwrap(InstanceLock.acquire(at: url).lock)
+        XCTAssertEqual(InstanceLock.probe(at: url), .heldBy(getpid()))
+        lock.release()
+        XCTAssertEqual(InstanceLock.probe(at: url), .free, "released")
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "", "no pid left behind")
+        XCTAssertNotNil(InstanceLock.acquire(at: url).lock)
+    }
+
+    func testAHolderThatWroteNoPidIsStillHeld() throws {
+        let url = try temporaryDirectory().appendingPathComponent("agent.lock")
+        let holder = Process()
+        holder.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+        holder.arguments = ["-e", "use Fcntl ':flock'; open(F, '>>', $ARGV[0]) or die; flock(F, LOCK_EX) or die; $| = 1; print \"locked\\n\"; sleep 5", url.path]
+        let out = Pipe()
+        holder.standardOutput = out
+        try holder.run()
+        defer { holder.terminate() }
+        _ = out.fileHandleForReading.availableData
+        XCTAssertEqual(InstanceLock.probe(at: url), .heldBy(nil))
+    }
+
     /// Anything other than "someone else holds it" is an error to show,
     /// not a reason to hand over to an instance that does not exist.
     func testALockThatCannotBeOpenedIsAnError() throws {

@@ -31,7 +31,7 @@ final class AccessibilityLabelTests: XCTestCase {
     /// were last known, as the screen does.
     func testTheCompactLabelIncludesTheLastKnownTime() {
         let entry = ISODate.parse("2026-09-27T12:04:00Z")!
-        let lastKnown = entry.addingTimeInterval(-26 * 3600)
+        let lastKnown = entry.addingTimeInterval(-50 * 3600)
         let account = WidgetContent.Account(id: "2", label: "sam@example.com", active: false, rows: [],
                                             note: "Log in again", lastKnownAt: lastKnown)
         let utc = TimeZone(identifier: "UTC")!
@@ -40,7 +40,20 @@ final class AccessibilityLabelTests: XCTestCase {
         let expected = TimeText.noteLine("Log in again", lastKnownAt: lastKnown, relativeTo: entry, locale: english,
                                          timeZone: utc, calendar: calendar)
         XCTAssertTrue(label.contains(expected), label)
-        XCTAssertTrue(label.contains("last known as of Sep 26"), label)
+        XCTAssertTrue(label.contains("last known as of Sep 25"), label)
+    }
+
+    /// Current numbers past their line are spoken as stale with their time,
+    /// as the screen shows them.
+    func testTheLabelSaysOldNumbersAreStale() {
+        let entry = ISODate.parse("2026-09-27T12:04:00Z")!
+        let measured = entry.addingTimeInterval(-16 * 3600)
+        var account = WidgetContent.Account(id: "1", label: "alex@example.com", active: true, rows: [], note: nil)
+        account.staleSince = measured
+        let utc = TimeZone(identifier: "UTC")!
+        let calendar = Calendar(identifier: .gregorian)
+        let label = Accessibility.label(for: account, locale: english, timeZone: utc, calendar: calendar, now: entry)
+        XCTAssertTrue(label.contains("stale \u{00B7} as of 8:04\u{202F}PM yesterday"), label)
     }
 
     @MainActor

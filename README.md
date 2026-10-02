@@ -42,7 +42,7 @@ providers; the agent and the widget make no network calls of their own.
 
 ```
 cswap list --json  ->  Usage Widget.app (agent)  ->  snapshot.json  ->  widget extension
-   every 60 s           unsandboxed, login item      App Group            sandboxed, reads only
+   every 60 s           unsandboxed, launchd job     App Group            sandboxed, reads only
 Codex rollouts, every 60 s   ^
 codex app-server, at most 8 a day
 ```
@@ -121,7 +121,7 @@ codex app-server, at most 8 a day
   - ordinary changes (percent, a pace tick appearing, a far reset moving, a
     provider's plan or banked reset count, a provider's error line) also
     wait 10 minutes;
-  - the shown numbers about to pass their provider's dimming line (two
+  - the shown numbers about to pass their provider's stale line (two
     hours for Claude, four for Codex) while newer ones exist is an ordinary
     change;
   - never more than 40 requests in any 24 hours, the low end of WidgetKit's
@@ -160,11 +160,15 @@ codex app-server, at most 8 a day
   resort Codex is drawn on one line; it is never left out, in either size).
   It only
   reads the snapshot; it never runs a process. It says "as of" the oldest
-  current measurement on screen, dims an account whose numbers are over two
-  hours old, and shows a failing account's note with when its numbers were
-  last known. Its timeline has an entry at the end of each 5 minute bucket
-  holding a reset or a dimming crossing, at most eight, and asks for a fresh
-  timeline after 3 hours.
+  current measurement on screen ("as of 7:08 PM yesterday" for the day
+  before), marks an account whose numbers are over two hours old with
+  "stale · as of" their time under its name while its bars keep their
+  colours, and shows a failing account's note with when its numbers were
+  last known. A snapshot more than 5 minutes old when the widget reads it
+  means the agent is not running (it writes every minute), and the footer
+  says "Not updating; open Usage Widget". Its timeline has an entry at the
+  end of each 5 minute bucket holding a reset or a stale crossing, at most
+  eight, and asks for a fresh timeline after 3 hours.
 - **App Group**: `<team id>.com.vishutdhar.usagewidget`, at
   `~/Library/Group Containers/<team id>.com.vishutdhar.usagewidget/`.
 
@@ -207,7 +211,7 @@ Shared code lives in the `Packages/UsageKit` package:
   infinite, or above 10,000); the widget shows "?" with no bar.
 - An account's `status` is `ok`, `relogin_required`, `unavailable` or
   `stale` (last known numbers, measured at `fetchedAt`), with a short
-  `statusNote`. Freshness is per account: the widget dims an account's bars
+  `statusNote`. Freshness is per account: the widget marks an account stale
   once its own `fetchedAt` is past its provider's line at the entry's date:
   two hours for Claude (cswap refreshes every few minutes) and four for
   Codex (asked every three hours while idle), so Codex does not flip stale
@@ -216,7 +220,7 @@ Shared code lives in the `Packages/UsageKit` package:
   `ageSeconds` is set on the Codex account: how old its numbers were when
   the snapshot was written, on the agent's continuous clock. The widget
   ages Codex numbers from it (plus the time since the write), so a wall
-  clock change neither dims fresh numbers nor brightens old ones. A rollout event or app-server
+  clock change neither marks fresh numbers stale nor old ones fresh. A rollout event or app-server
   reply without a usable window is not a reading.
 - `writeSequence` goes up by one with every write, and `writerId` is a
   random id the agent draws at each launch. They, not `writtenAt` (which
@@ -257,9 +261,40 @@ Scripts/build.sh     # xcodegen, package tests, signed Release build into build/
 Scripts/install.sh   # copies to ~/Applications, registers, launches
 ```
 
-Each launch reads the system's login item status and registers the app
-when it is not registered, unless Start at login was turned off in the
-status window. Placing a widget has no public API, so
+The agent runs as a launchd job (`LaunchAgent/`, copied into the app and
+registered with SMAppService). launchd starts it at login and starts it
+again after any exit but a clean one. Only Stop in the status window,
+confirmed in its sheet, and the end of the session (log out, restart, shut
+down) exit 0; any other quit, such as a quit Apple Event or a stray
+automated click, exits 1 and the agent comes back. After Stop it stays
+stopped until the next login or until the app is opened; while it is
+stopped the widget says "Not updating". Turning Start at login off removes
+the job and so stops the agent at once; turning it on starts it. Each
+launch reads the job's status and registers it when it is not registered,
+unless Start at login was turned off in the status window. The running
+copy is always launchd's: a copy opened by hand registers the job if it
+should, starts it, and leaves only once another live process holds the
+agent lock (its holder writes its pid into the lock file), then asks that
+copy for its window. launchd's copy waits up to 10 s for the lock while
+another copy is leaving, and exits non-zero if it never gets it, so
+KeepAlive tries again. When the job cannot run (Start at login off,
+awaiting approval, a registration error, a failed kickstart, or no
+takeover within 15 s) the opened copy runs the agent itself, and its
+status window says it is not supervised and why; it tries again every
+minute, pausing its polling and letting go of the lock only after
+kickstart worked, and takes the lock back if nobody took it. An old app login
+item turned off in System Settings carries over as Start at login off.
+From a terminal, the app's executable takes `--stop` (as Stop does),
+`--start-at-login on|off` (as the toggle does) and `--register-job`.
+`Scripts/install.sh` stops the agent with means every earlier build
+supports (`launchctl bootout` for the job, the new `--stop` for a copy
+outside launchd, else ending it by its exact path), replaces the app, has
+the new executable register the job again (a replaced app must be), opens
+it, and checks that launchd's process runs the installed executable;
+`Scripts/test-install.sh` checks that sequence with stubs, including an
+old executable that knows none of the flags.
+Builds before this registered the app itself as a login item; the first
+launch removes that item once and registers the job in its place. Placing a widget has no public API, so
 this step is manual: right-click the desktop, choose Edit Widgets, search
 "Usage", and drag the medium size onto the desktop.
 

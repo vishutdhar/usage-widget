@@ -23,7 +23,14 @@ targets:
   UsageWidget:
     type: application
     platform: macOS
-    sources: [App]
+    sources:
+      - App
+      # The agent's launchd job, registered with SMAppService.agent.
+      - path: LaunchAgent/com.vishutdhar.usagewidget.agent.plist
+        buildPhase:
+          copyFiles:
+            destination: wrapper
+            subpath: Contents/Library/LaunchAgents
     dependencies:
       - package: UsageKit
         product: UsageCore

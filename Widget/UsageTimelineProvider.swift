@@ -24,7 +24,8 @@ struct UsageTimelineProvider: TimelineProvider {
     func getSnapshot(in context: Context, completion: @escaping @Sendable (UsageEntry) -> Void) {
         let now = Date()
         let snapshot = readSnapshot() ?? (context.isPreview ? SampleSnapshot.make(now: now) : nil)
-        completion(UsageEntry(date: now, content: WidgetContent.make(snapshot: snapshot, at: now)))
+        completion(UsageEntry(date: now, content: WidgetContent.make(snapshot: snapshot, at: now, refresh: nil,
+                                                                     checkedAt: now)))
     }
 
     func getTimeline(in context: Context, completion: @escaping @Sendable (Timeline<UsageEntry>) -> Void) {
@@ -35,10 +36,12 @@ struct UsageTimelineProvider: TimelineProvider {
         // each entry computes its own ages, so a later entry looks as old as
         // it will be. While a press of the refresh button is being answered
         // the footer says "Refreshing…", and an entry marks where that ends.
+        // A snapshot already old when read means the agent stopped writing;
+        // every entry says so, judged at this read and not at the entry
+        // (see WidgetContent.timelineEntries).
         let plan = TimelinePlan.plan(for: snapshot, now: now, refresh: refresh)
-        let entries = plan.entries.map { date in
-            UsageEntry(date: date, content: WidgetContent.make(snapshot: snapshot, at: date, refresh: refresh))
-        }
+        let entries = WidgetContent.timelineEntries(for: snapshot, readAt: now, refresh: refresh, dates: plan.entries)
+            .map { UsageEntry(date: $0.date, content: $0.content) }
         logTimelineCall(now: now, family: context.family, snapshot: snapshot, plan: plan)
         completion(Timeline(entries: entries, policy: .after(plan.reloadAfter)))
     }

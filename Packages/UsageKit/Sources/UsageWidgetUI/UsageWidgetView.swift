@@ -237,7 +237,8 @@ struct MediumLayout: View {
         VStack(alignment: .leading, spacing: 0) {
             grid
             Spacer(minLength: 4)  // the as of line sits at the bottom
-            AsOfLine(date: Self.asOf(in: content, visibleOthers: visibleOthers), now: content.date, footer: content.refreshFooter)
+            AsOfLine(date: Self.asOf(in: content, visibleOthers: visibleOthers), now: content.date, footer: content.refreshFooter,
+                     notUpdating: content.notUpdating)
         }
     }
 
@@ -342,7 +343,8 @@ struct LargeLayout: View {
         VStack(alignment: .leading, spacing: 0) {
             grid
             Spacer(minLength: 4)  // the as of line sits at the bottom
-            AsOfLine(date: Self.asOf(in: content, shown: shown), now: content.date, footer: content.refreshFooter)
+            AsOfLine(date: Self.asOf(in: content, shown: shown), now: content.date, footer: content.refreshFooter,
+                     notUpdating: content.notUpdating)
         }
     }
 
@@ -400,7 +402,7 @@ private struct AccountBlock: View {
         AccountHeader(account: account)
         NoteRow(account: account, now: now)
         ForEach(Array(compact.rows.enumerated()), id: \.offset) { _, row in
-            WindowRowView(row: row, reservesMarker: reservesMarker, dimmed: account.dimmed)
+            WindowRowView(row: row, reservesMarker: reservesMarker)
         }
         if compact.hidden > 0 {
             MoreWindowsRow(count: compact.hidden)
@@ -410,8 +412,8 @@ private struct AccountBlock: View {
 
 /// The footer: "as of 12:04 PM" (when the oldest current numbers on
 /// screen were measured), "Refreshing…" while a press of the refresh
-/// button is being answered, or a note when its reload was held back, with
-/// the refresh control at the right.
+/// button is being answered, or "Not updating" when the agent has stopped
+/// writing, with the refresh control at the right.
 struct AsOfLine: View {
     @Environment(\.locale) private var locale
     @Environment(\.timeZone) private var timeZone
@@ -420,10 +422,11 @@ struct AsOfLine: View {
     let date: Date?
     let now: Date
     var footer: RefreshFooter = .none
+    var notUpdating = false
 
     var body: some View {
         let text = Self.text(date: date, footer: footer, now: now, locale: locale, timeZone: timeZone,
-                             calendar: calendar)
+                             calendar: calendar, notUpdating: notUpdating)
         if text != nil || refreshControl != nil {
             // The control sits over the line's right end, so the footer is
             // exactly one line of text high and every layout fits as before.
@@ -442,11 +445,14 @@ struct AsOfLine: View {
     }
 
     static func text(date: Date?, footer: RefreshFooter, now: Date, locale: Locale, timeZone: TimeZone,
-                     calendar: Calendar) -> String? {
+                     calendar: Calendar, notUpdating: Bool = false) -> String? {
         switch footer {
         case .refreshing:
             return "Refreshing\u{2026}"
         case .none:
+            // The agent's snapshot stopped arriving: say so, since the
+            // numbers will not move until it runs again.
+            if notUpdating { return "Not updating; open Usage Widget" }
             return date.map { TimeText.asOf($0, relativeTo: now, locale: locale, timeZone: timeZone, calendar: calendar) }
         }
     }

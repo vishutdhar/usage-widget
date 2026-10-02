@@ -55,7 +55,6 @@ struct WindowRowView: View {
     @Environment(\.locale) private var locale
     let row: WindowRow
     let reservesMarker: Bool
-    var dimmed = false
 
     var body: some View {
         GridRow {
@@ -65,7 +64,7 @@ struct WindowRowView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .gridColumnAlignment(.leading)
-            UsageBar(fraction: row.fraction, level: row.level, paceFraction: row.paceFraction, dimmed: dimmed)
+            UsageBar(fraction: row.fraction, level: row.level, paceFraction: row.paceFraction)
                 .frame(minWidth: 40)
             if reservesMarker {
                 Text(row.overMarker ? "(!)" : "")
@@ -134,15 +133,29 @@ struct NoteRow: View {
     let now: Date
 
     var body: some View {
-        if let note = account.note {
+        if let line = NoteRow.line(for: account, now: now, locale: locale, timeZone: timeZone, calendar: calendar) {
             IndentedLine {
-                Text(verbatim: TimeText.noteLine(note, lastKnownAt: account.lastKnownAt, relativeTo: now,
-                                                 locale: locale, timeZone: timeZone, calendar: calendar))
+                Text(verbatim: line)
                     .font(Style.label)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
+        }
+    }
+}
+
+extension NoteRow {
+    /// The account's note with its last known time, or for current numbers
+    /// past their line "stale · as of 7:08 PM yesterday"; nil otherwise.
+    nonisolated static func line(for account: WidgetContent.Account, now: Date, locale: Locale, timeZone: TimeZone,
+                     calendar: Calendar) -> String? {
+        if let note = account.note {
+            return TimeText.noteLine(note, lastKnownAt: account.lastKnownAt, relativeTo: now, locale: locale,
+                                     timeZone: timeZone, calendar: calendar)
+        }
+        return account.staleSince.map {
+            TimeText.staleLine(since: $0, relativeTo: now, locale: locale, timeZone: timeZone, calendar: calendar)
         }
     }
 }
@@ -196,7 +209,7 @@ struct CompactAccountRow: View {
                 ForEach(Array(compact.rows.enumerated()), id: \.offset) { _, row in
                     HStack(spacing: 3) {
                         Circle()
-                            .fill(account.dimmed ? Color(nsColor: .secondaryLabelColor) : row.level.fillColor)
+                            .fill(row.level.fillColor)
                             .frame(width: 5, height: 5)
                         Text(row.label).font(Style.label).foregroundStyle(.secondary)
                         Text(row.percentText).font(Style.digits)
@@ -228,7 +241,11 @@ struct CompactAccountRow: View {
     /// current. Without a known time, the account's note.
     static func trailingNote(for account: WidgetContent.Account, now: Date, locale: Locale, timeZone: TimeZone,
                              calendar: Calendar) -> String? {
-        guard let note = account.note else { return nil }
+        guard let note = account.note else {
+            return account.staleSince.map {
+                TimeText.staleLine(since: $0, relativeTo: now, locale: locale, timeZone: timeZone, calendar: calendar)
+            }
+        }
         guard let known = account.lastKnownAt else { return note }
         return TimeText.asOf(known, relativeTo: now, locale: locale, timeZone: timeZone, calendar: calendar)
     }
@@ -275,9 +292,8 @@ enum Accessibility {
                       now: Date) -> String {
         var parts = [name(of: account)]
         if account.active { parts.append("active") }
-        if let note = account.note {
-            parts.append(TimeText.noteLine(note, lastKnownAt: account.lastKnownAt, relativeTo: now, locale: locale,
-                                           timeZone: timeZone, calendar: calendar))
+        if let line = NoteRow.line(for: account, now: now, locale: locale, timeZone: timeZone, calendar: calendar) {
+            parts.append(line)
         }
         parts += account.rows.map { label(for: $0, locale: locale) }
         if let footnote = account.footnote { parts.append(footnote) }

@@ -2,6 +2,10 @@ import Foundation
 
 /// Everything a widget view needs, computed from a snapshot at one moment.
 public struct WidgetContent: Equatable, Sendable {
+    /// The agent has stopped writing: the footer says the widget is not
+    /// updating.
+    public var notUpdating = false
+
     public struct Account: Equatable, Sendable, Identifiable {
         public var id: String
         public var label: String
@@ -13,9 +17,12 @@ public struct WidgetContent: Equatable, Sendable {
         /// When the last known numbers were measured, for an account that is
         /// not current but still has numbers to show.
         public var lastKnownAt: Date?
-        /// Bars drawn in a secondary colour: the numbers are over two hours
-        /// old at this entry's date.
+        /// The numbers are past their provider's stale line at this entry's
+        /// date. Data only: bars keep their colours whatever their age.
         public var dimmed: Bool
+        /// Set when the numbers are past their provider's line at this
+        /// entry's date: when they were measured, for the "stale" line.
+        public var staleSince: Date?
         /// When the numbers shown were measured.
         public var measuredAt: Date?
         /// The numbers are current (status ok), so they count toward "as of".
@@ -145,6 +152,19 @@ public struct WidgetContent: Equatable, Sendable {
     /// - Parameter date: the moment the entry is shown. Resets that have
     ///   passed by then are rolled forward, and each account ages from its
     ///   own measurement time, so a future entry is as old as it will look.
+    /// - Parameter checkedAt: when the widget read the snapshot; one already
+    ///   more than `agentSilence` old then means the agent is not running.
+    public static func make(snapshot: UsageSnapshot?, at date: Date, refresh: RefreshRequest?,
+                            checkedAt: Date) -> WidgetContent {
+        var content = make(snapshot: snapshot, at: date, refresh: refresh)
+        if let snapshot { content.notUpdating = checkedAt.timeIntervalSince(snapshot.writtenAt) > agentSilence }
+        return content
+    }
+
+    /// The agent rewrites the snapshot every minute; one older than this
+    /// when the widget reads it means the agent is not running.
+    public static let agentSilence: TimeInterval = 5 * 60
+
     public static func make(snapshot: UsageSnapshot?, at date: Date, refresh: RefreshRequest?) -> WidgetContent {
         var content = make(snapshot: snapshot, at: date)
         content.refreshFooter = RefreshState.footer(request: refresh, snapshot: snapshot?.mark, at: date)
@@ -176,10 +196,14 @@ public struct WidgetContent: Equatable, Sendable {
             ? (rows.isEmpty ? unavailableNote : nil)
             : (account.statusNote ?? unavailableNote)
         let lastKnown = account.status != .ok && !rows.isEmpty ? account.fetchedAt : nil
-        return Account(id: account.id, label: account.label, active: account.active, rows: rows,
-                       note: note, lastKnownAt: lastKnown,
-                       dimmed: !rows.isEmpty && Staleness.isDimmed(account, writtenAt: writtenAt, at: date, provider: provider),
-                       measuredAt: account.fetchedAt, current: account.status == .ok)
+        let dimmed = !rows.isEmpty && Staleness.isDimmed(account, writtenAt: writtenAt, at: date, provider: provider)
+        var shown = Account(id: account.id, label: account.label, active: account.active, rows: rows,
+                            note: note, lastKnownAt: lastKnown, dimmed: dimmed,
+                            measuredAt: account.fetchedAt, current: account.status == .ok)
+        // Current numbers past their line say so in words; the bars keep
+        // their usage colours.
+        if dimmed, account.status == .ok { shown.staleSince = account.fetchedAt }
+        return shown
     }
 
     public static func title(forProvider provider: String) -> String {
@@ -187,6 +211,29 @@ public struct WidgetContent: Equatable, Sendable {
         case "claude": return "Claude"
         case "codex": return "Codex"
         default: return provider.prefix(1).uppercased() + provider.dropFirst()
+        }
+    }
+}
+
+extension WidgetContent {
+    /// One timeline entry: its date and what it shows.
+    public struct TimelineEntry {
+        public let date: Date
+        public let content: WidgetContent
+    }
+
+    /// The entries for a read of the snapshot at `readAt` (the plan's
+    /// dates unless given). Whether the agent stopped is judged at the
+    /// read, never at an entry's date: between reads WidgetKit shows these
+    /// entries, and a healthy agent asks for a read only when the display
+    /// changes, so an entry's age says nothing about the agent. A stopped
+    /// agent shows at the next read, which the plan's fallback brings
+    /// within `TimelinePlan.reloadFloor`.
+    public static func timelineEntries(for snapshot: UsageSnapshot?, readAt: Date, refresh: RefreshRequest?,
+                                       dates: [Date]? = nil) -> [TimelineEntry] {
+        let dates = dates ?? TimelinePlan.plan(for: snapshot, now: readAt, refresh: refresh).entries
+        return dates.map {
+            TimelineEntry(date: $0, content: make(snapshot: snapshot, at: $0, refresh: refresh, checkedAt: readAt))
         }
     }
 }

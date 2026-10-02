@@ -5,10 +5,15 @@ import Foundation
 public final class InstanceLock: @unchecked Sendable {
     public let url: URL
     private let fd: Int32
+    private var released = false
+    /// Why the holder's pid could not be written into the lock, if so: a
+    /// copy handing over then cannot confirm the takeover, so it is logged.
+    public let publishError: String?
 
-    private init(url: URL, fd: Int32) {
+    private init(url: URL, fd: Int32, publishError: String?) {
         self.url = url
         self.fd = fd
+        self.publishError = publishError
     }
 
     public enum Outcome {
@@ -48,13 +53,49 @@ public final class InstanceLock: @unchecked Sendable {
             close(fd)
             return code == EWOULDBLOCK ? .heldElsewhere : .failed(String(cString: strerror(code)))
         }
-        return .acquired(InstanceLock(url: url, fd: fd))
+        // The holder's pid, so a copy handing over can see who took it.
+        let publishError = SafeFile.publishLockHolder(fd, pid: getpid())
+        return .acquired(InstanceLock(url: url, fd: fd, publishError: publishError))
     }
 
-    deinit {
+    /// Whether the lock is held and by which pid, without keeping it: a
+    /// free lock is let go at once.
+    public static func probe(at url: URL) -> LockProbe {
+        let fd = SafeFile.openLock(url)
+        guard fd >= 0 else { return .failed(String(cString: strerror(errno))) }
+        defer { close(fd) }
+        if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+            flock(fd, LOCK_UN)
+            return .free
+        }
+        let code = errno
+        guard code == EWOULDBLOCK else { return .failed(String(cString: strerror(code))) }
+        return .heldBy(SafeFile.readLockHolder(fd))
+    }
+
+    public var isReleased: Bool { released }
+
+    /// Lets go now (the pid is cleared first) instead of when this object
+    /// goes away.
+    public func release() {
+        guard !released else { return }
+        released = true
+        _ = SafeFile.clearLockHolder(fd)  // a stale pid is checked for life by the reader
         flock(fd, LOCK_UN)
         close(fd)
     }
+
+    deinit {
+        release()
+    }
+}
+
+/// What a look at the agent lock found.
+public enum LockProbe: Equatable, Sendable {
+    case free
+    /// Held; by this pid when the holder wrote one.
+    case heldBy(Int32?)
+    case failed(String)
 }
 
 /// Masks personal details in text that leaves the agent: the snapshot's
