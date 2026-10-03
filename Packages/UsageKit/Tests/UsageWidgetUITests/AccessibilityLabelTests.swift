@@ -67,13 +67,29 @@ final class AccessibilityLabelTests: XCTestCase {
         let snapshot = UsageSnapshot(writtenAt: entry, providers: [
             ProviderUsage(provider: "claude", source: "cswap-list", status: .ok, accounts: [
                 account("1", active: true, measured: entry.addingTimeInterval(-60)),
-                account("2", active: false, measured: entry.addingTimeInterval(-86_400)),
+                account("2", active: false, measured: entry.addingTimeInterval(-30 * 60)),
             ]),
         ])
         let content = WidgetContent.make(snapshot: snapshot, at: entry)
         XCTAssertEqual(MediumLayout.shown(in: content, visibleOthers: 0).map(\.id), ["1"])
         XCTAssertEqual(MediumLayout.asOf(in: content, visibleOthers: 0), entry.addingTimeInterval(-60))
-        XCTAssertEqual(MediumLayout.asOf(in: content, visibleOthers: 1), entry.addingTimeInterval(-86_400))
+        XCTAssertEqual(MediumLayout.asOf(in: content, visibleOthers: 1), entry.addingTimeInterval(-30 * 60),
+                       "the oldest of the accounts shown")
         XCTAssertEqual(LargeLayout.asOf(in: content, shown: 1), entry.addingTimeInterval(-60))
+    }
+
+    /// Rows a layout leaves out are still spoken, with the header: the two
+    /// row cut drops the 5 hour window, and VoiceOver still hears it.
+    func testOmittedWindowsAreStillSpoken() {
+        let now = ISODate.parse("2026-09-27T12:04:00Z")!
+        let rows = [UsageWindow(kind: .session, name: "5h", windowSeconds: 18_000, usedPct: 100),
+                    UsageWindow(kind: .weekly, name: "7d", windowSeconds: 604_800, usedPct: 50),
+                    UsageWindow(kind: .model, name: "Fable", windowSeconds: 604_800, usedPct: 90)]
+            .map { UsageDisplay.row(for: $0, at: now) }
+        let account = WidgetContent.Account(id: "1", label: "a@example.com", active: true, rows: rows, note: nil)
+        XCTAssertEqual(account.omittedRows(limit: 2).map(\.label), ["5h"])
+        XCTAssertEqual(account.omittedRows(limit: 3), [])
+        let header = Accessibility.header(for: account, omitted: account.omittedRows(limit: 2), locale: english)
+        XCTAssertEqual(header, "Account 1, a@example.com, active, 5 hour 100 percent, over limit, not shown")
     }
 }

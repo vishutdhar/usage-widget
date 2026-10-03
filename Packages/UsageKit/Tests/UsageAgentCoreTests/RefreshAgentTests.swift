@@ -8,6 +8,9 @@ import UsageCore
 /// minutes, which counts toward the background cap like any background
 /// reload. A press never runs the background decision and never leaves a
 /// note about limits.
+/// A press made long enough ago that the intent stopped waiting for it.
+private let late = RefreshRequestStore.intentWait + 1
+
 final class RefreshAgentTests: XCTestCase {
     let start = Date(timeIntervalSince1970: 1_790_000_000)
 
@@ -34,7 +37,7 @@ final class RefreshAgentTests: XCTestCase {
     }
 
     func press(_ agent: UsageAgent, _ dir: URL, _ clock: ManualClock) async throws -> TickReport? {
-        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         guard await agent.takeRefreshRequest() else { return nil }
         return await agent.tick(userRequested: true)
     }
@@ -50,7 +53,7 @@ final class RefreshAgentTests: XCTestCase {
         _ = await agent.tick()
         XCTAssertEqual(reloads.count, 1, "the first request")
         clock.advance(20)
-        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         let taken = await agent.takeRefreshRequest()
         XCTAssertTrue(taken)
         let again = await agent.takeRefreshRequest()
@@ -61,7 +64,7 @@ final class RefreshAgentTests: XCTestCase {
         XCTAssertEqual(reloads.count, 2)
         let last = try XCTUnwrap(try log(dir).split(separator: "\n").last)
         XCTAssertTrue(last.contains("reasons=user") && last.contains("kind=press") && last.contains("id=2"), String(last))
-        XCTAssertEqual(state(dir)?.requests.count, 2, "the completion reload counts toward the cap")
+        XCTAssertEqual(state(dir)?.requests.count, 2, "the completion reload counts like a background one")
         clock.advance(31)
         let later = await agent.takeRefreshRequest()
         XCTAssertFalse(later, "past the debounce, the same press is still not taken again")
@@ -74,21 +77,21 @@ final class RefreshAgentTests: XCTestCase {
         let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp })
         _ = await agent.tick()
         clock.advance(5)
-        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         let first = await agent.takeRefreshRequest()
         XCTAssertTrue(first)
         _ = await agent.tick(userRequested: true)
         clock.advance(29)
-        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         let second = await agent.takeRefreshRequest()
         XCTAssertFalse(second, "29 s after the last")
         clock.advance(2)
-        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         let third = await agent.takeRefreshRequest()
         XCTAssertTrue(third, "31 s after the last")
     }
 
-    /// At the cap a press still polls and writes fresh numbers for the
+    /// At the ceiling a press still polls and writes fresh numbers for the
     /// intent's reload; the agent adds no reload, and no note is left.
     func testAPressAtTheCapPollsButAddsNoReload() async throws {
         let dir = try makeTemporaryDirectory()
@@ -98,7 +101,7 @@ final class RefreshAgentTests: XCTestCase {
         let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: { reloads.increment() },
                                clock: { clock.stamp })
         clock.advance(5)
-        let request = try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+        let request = try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         let taken = await agent.takeRefreshRequest()
         XCTAssertTrue(taken)
         let report = await agent.tick(userRequested: true)
@@ -108,6 +111,97 @@ final class RefreshAgentTests: XCTestCase {
                              request.afterSnapshot, "fresh numbers on disk")
         XCTAssertEqual(state(dir)?.requests.count, ReloadScheduler.dailyCap)
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("refresh-result.json").path))
+    }
+
+    /// A slow press's completion reload takes a token like any background
+    /// reload. With the bucket empty it does not go; the change it would
+    /// have shown is still unshown, so the background scheduler shows it
+    /// as soon as the next token arrives.
+    func testASlowPressWithAnEmptyBucketGoesOneTokenIntoDebt() async throws {
+        let dir = try makeTemporaryDirectory()
+        var seeded = ReloadState()
+        seeded.bucketTokens = 0
+        seeded.bucketAt = SchedulerClock(wall: start, continuous: 0, boot: nil)
+        try ReloadStateStore.write(seeded, to: dir.appendingPathComponent(ReloadStateStore.fileName))
+        let clock = ManualClock(start)
+        let reloads = Counter()
+        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: { reloads.increment() },
+                               clock: { clock.stamp })
+        clock.advance(5)
+        let report = try await press(agent, dir, clock)
+        XCTAssertNotNil(report)
+        XCTAssertEqual(reloads.count, 1, "a press that worked always redraws: one token of debt")
+        XCTAssertTrue(report?.reloadReasons.contains(.user) ?? false)
+        XCTAssertEqual(report?.budget?.tokens, 0)
+        XCTAssertEqual(ReloadBucket.tokens(try XCTUnwrap(state(dir)), at: clock.stamp), -1 + 5 / ReloadBucket.refill,
+                       accuracy: 1e-6, "the token refilled in the 5 s before the press, less the one borrowed")
+        clock.advance(11 * 60)
+        let second = try await press(agent, dir, clock)
+        XCTAssertEqual(reloads.count, 1, "in debt, a second slow press waits")
+        XCTAssertEqual(second?.reloadReasons, [])
+    }
+
+    /// Whether a press's answer came too late for the intent is judged when
+    /// the answer is on disk, not when cswap returned: a 15 s cswap run and
+    /// a 19 s Codex read write the answer 34 s after the press, past the
+    /// intent's 25 s, so the completion reload follows. (cswap's own limit
+    /// is 50 s, so such a poll is possible.)
+    func testLatenessIsJudgedWhenTheAnswerIsWritten() async throws {
+        let dir = try makeTemporaryDirectory()
+        let clock = ManualClock(start)
+        let reloads = Counter()
+        let slow = SlowSteps()
+        let codex = FakeCodex(rollout: nil, appServer: [.failure(FetchFailure(reason: "not asked"))])
+        codex.setRolloutAt { date in
+            if slow.on { clock.advance(19) }
+            return CodexReading(source: .rollout, measuredAt: date,
+                                windows: [UsageWindow(kind: .weekly, name: "Weekly", windowSeconds: 604_800, usedPct: 10)])
+        }
+        let agent = UsageAgent(directory: dir, runner: SlowRunner(clock: clock, slow: slow, seconds: 15),
+                               reload: { reloads.increment() }, clock: { clock.stamp }, codex: codex)
+        _ = await agent.tick()
+        clock.advance(11 * 60)
+        try RefreshRequestStore.request(in: dir, at: clock.now)
+        let taken = await agent.takeRefreshRequest()
+        XCTAssertTrue(taken)
+        let before = reloads.count
+        slow.on = true
+        let report = await agent.tick(userRequested: true)
+        XCTAssertEqual(reloads.count - before, 1, "answered 34 s after the press; the intent had given up")
+        XCTAssertTrue(report.reloadReasons.contains(.user))
+    }
+
+    /// A day of slow presses, every two minutes, each answered after the
+    /// intent gave up: completion reloads take tokens like any other (one
+    /// at most in debt), so the agent's day stays within the ceiling (47),
+    /// 55 with the fallback.
+    func testADayOfSlowPressesStaysWithinTheBucket() async throws {
+        let dir = try makeTemporaryDirectory()
+        let clock = ManualClock(start)
+        let reloads = Counter()
+        let agent = UsageAgent(directory: dir, runner: AlternatingRunner(), reload: { reloads.increment() },
+                               clock: { clock.stamp })
+        for minute in 0..<(24 * 60) {
+            if minute % 2 == 1 {
+                try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
+                if await agent.takeRefreshRequest() { _ = await agent.tick(userRequested: true) }
+            } else {
+                _ = await agent.tick()
+            }
+            clock.advance(60)
+        }
+        XCTAssertLessThanOrEqual(reloads.count, ReloadScheduler.dailyCap)
+        XCTAssertLessThanOrEqual(reloads.count + 8, 55)
+    }
+
+    /// The intent waits out the slowest poll a press usually makes (cswap, plus
+    /// an app-server ask to Codex of up to its 20 s timeout), so its own
+    /// reload, which is free, shows the fresh numbers; and it stays under
+    /// the system's limit for an intent.
+    func testTheIntentWaitsOutTheSlowestPoll() {
+        XCTAssertEqual(RefreshRequestStore.intentWait, 25)
+        XCTAssertGreaterThan(RefreshRequestStore.intentWait, CodexAppServerClient().timeout + 2)
+        XCTAssertLessThan(RefreshRequestStore.intentWait, 30)
     }
 
     /// A hundred presses, 31 s apart: only their completion reloads count
@@ -185,7 +279,7 @@ final class RefreshAgentTests: XCTestCase {
         XCTAssertEqual(runner.calls - before, 1, "one cswap run for the press")
         XCTAssertEqual(reloads.count, 1, "the first poll's only; no completion reload")
         clock.advance(40)
-        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         let next = await agent.takeRefreshRequest()
         XCTAssertTrue(next, "a later press is taken as usual")
     }
@@ -209,22 +303,27 @@ final class RefreshAgentTests: XCTestCase {
         XCTAssertEqual(quick.reloadReasons, [], "answered within the wait")
         XCTAssertEqual(reloads.count, 1)
         XCTAssertEqual(state(dir)?.requests.count, 1, "nothing spent")
+        let tokensBefore = ReloadBucket.tokens(try XCTUnwrap(state(dir)), at: clock.stamp)
 
         clock.advance(40)
         try RefreshRequestStore.request(in: dir, at: clock.now)
         taken = await agent.takeRefreshRequest()
         XCTAssertTrue(taken)
-        clock.advance(6)
+        clock.advance(late)
         let slow = await agent.tick(userRequested: true)
         XCTAssertTrue(slow.reloadReasons.contains(.user), "the intent gave up; the agent reloads")
         XCTAssertEqual(reloads.count, 2)
-        XCTAssertEqual(state(dir)?.requests.count, 2)
+        XCTAssertEqual(state(dir)?.requests.count, 2, "it counts like a background request")
+        let refilled = (40 + late) / ReloadBucket.refill
+        XCTAssertEqual(ReloadBucket.tokens(try XCTUnwrap(state(dir)), at: clock.stamp), tokensBefore + refilled - 1,
+                       accuracy: 1e-6, "and takes a token")
     }
 
-    /// The intent looks every 0.25 s until 5 s: an answer written 4.75 s
-    /// or more after the press may not be seen, one written sooner is.
+    /// The intent looks every 0.25 s until its wait ends: an answer written
+    /// at its last look or later may not be seen, one written sooner is.
     func testTheCompletionBoundaryIsTheIntentsLastLook() async throws {
-        for (delay, expected) in [(4.74, 0), (4.75, 1)] {
+        let lastLook = RefreshRequestStore.intentWait - RefreshRequestStore.intentPoll
+        for (delay, expected) in [(lastLook - 0.01, 0), (lastLook, 1)] {
             let dir = try makeTemporaryDirectory()
             let clock = ManualClock(start)
             let reloads = Counter()
@@ -272,10 +371,10 @@ final class RefreshAgentTests: XCTestCase {
     }
 
     /// A scheduled poll that answers a press too late for the intent (its
-    /// 5 s wait already over) adds the counted completion reload; one that
-    /// answers in time adds nothing.
+    /// wait already over) adds the completion reload; one that answers in
+    /// time adds nothing. Neither touches the background count.
     func testAScheduledPollAnsweringAPressLateAddsTheCompletionReload() async throws {
-        for (delay, expected) in [(6.0, 1), (1.0, 0)] {
+        for (delay, expected) in [(late, 1), (1.0, 0)] {
             let dir = try makeTemporaryDirectory()
             let clock = ManualClock(start)
             let reloads = Counter()
@@ -303,7 +402,7 @@ final class RefreshAgentTests: XCTestCase {
                                clock: { clock.stamp })
         _ = await agent.tick()
         clock.advance(11 * 60)
-        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         let report = await agent.tick()
         XCTAssertEqual(reloads.count, 2, "the poll's own reload, and no second one")
         XCTAssertFalse(report.reloadReasons.contains(.user))
@@ -401,7 +500,7 @@ final class RefreshAgentTests: XCTestCase {
     /// intent's own reload already showed the unanswered snapshot, so the
     /// answer brings one counted completion reload. Noticed in time, none.
     func testALateDebouncedAnswerBringsTheCompletionReload() async throws {
-        for (late, expected) in [(6.0, 1), (1.0, 0)] {
+        for (late, expected) in [(RefreshRequestStore.intentWait + 1, 1), (1.0, 0)] {
             let dir = try makeTemporaryDirectory()
             let clock = ManualClock(start)
             let reloads = Counter()
@@ -447,7 +546,7 @@ final class RefreshAgentTests: XCTestCase {
         XCTAssertNotNil(quick.stateError, "still failing")
         saver.failing = false
         try RefreshRequestStore.request(in: dir, at: clock.now)
-        clock.advance(6)
+        clock.advance(late)
         let second = await agent.takeRefreshRequest()
         XCTAssertFalse(second)
         XCTAssertEqual(reloads.count, 1, "the late answer's completion reload, saved first")
@@ -505,7 +604,7 @@ final class RefreshAgentTests: XCTestCase {
         _ = await agent.tick()
         XCTAssertEqual(reloads.count, 1)
         clock.advance(11 * 60)
-        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         let taken = await agent.takeRefreshRequest()
         XCTAssertTrue(taken)
         let snapshot = dir.appendingPathComponent("snapshot.json")
@@ -545,12 +644,12 @@ final class RefreshAgentTests: XCTestCase {
         let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp })
         _ = await agent.tick()
         clock.advance(10)
-        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         let first = await agent.takeRefreshRequest()
         XCTAssertTrue(first)
         clock.setWall(start.addingTimeInterval(-3600))
         clock.advance(40)
-        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         let second = await agent.takeRefreshRequest()
         XCTAssertTrue(second, "numbered presses do not care about the wall clock")
     }
@@ -587,11 +686,11 @@ final class RefreshAgentTests: XCTestCase {
         let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp })
         try FileManager.default.removeItem(at: dir.appendingPathComponent(RefreshRequestStore.fileName))
         clock.advance(5)
-        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         let taken = await agent.takeRefreshRequest()
         XCTAssertTrue(taken)
         clock.advance(40)
-        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+        try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         let next = await agent.takeRefreshRequest()
         XCTAssertTrue(next, "the new session goes on counting")
     }
@@ -606,7 +705,7 @@ final class RefreshAgentTests: XCTestCase {
         try SnapshotStore.write(old, to: dir.appendingPathComponent("snapshot.json"))
         let clock = ManualClock(noon.addingTimeInterval(-300))
         let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp })
-        let request = try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+        let request = try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         XCTAssertEqual(request.afterSnapshot, 5)
         let taken = await agent.takeRefreshRequest()
         XCTAssertTrue(taken)
@@ -689,7 +788,7 @@ final class RefreshAgentTests: XCTestCase {
                 agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: { reloads.increment() },
                                    clock: { clock.stamp })
             }
-            try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+            try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
             if await agent.takeRefreshRequest() { _ = await agent.tick(userRequested: true) }
         }
         XCTAssertEqual(reloads.count, 0, "the launch counts as a reload; the hour is not up")
@@ -701,10 +800,14 @@ final class RefreshAgentTests: XCTestCase {
 final class BudgetAgentTests: XCTestCase {
     let start = Date(timeIntervalSince1970: 1_790_000_000)
 
-    /// The worst day: numbers moving every minute and a press every two
-    /// minutes. The agent asks for exactly the cap, 40, in 24 hours; with
-    /// the widget's own fallback of 8 the day's total is 48.
-    func testAWorstCaseDayIsFortyEight() async throws {
+    /// A busy day: numbers moving every minute and a press every two
+    /// minutes, each answered while its intent waits (presses take a few
+    /// seconds; only one slower than the intent's 25 s wait gets a
+    /// completion reload, at most one every 10 minutes). The agent asks for
+    /// a full bucket (6) plus the tokens that arrive during the day (39
+    /// before its last minute): 45, under the 47 ceiling; with the widget's
+    /// own fallback of 8 the day stays at most 55.
+    func testAWorstCaseDayIsAtMostFiftyFive() async throws {
         XCTAssertEqual(Int((24 * 3600) / TimelinePlan.reloadFloor), 8)
         let dir = try makeTemporaryDirectory()
         let clock = ManualClock(start)
@@ -715,15 +818,16 @@ final class BudgetAgentTests: XCTestCase {
             _ = await agent.tick()
             if minute % 2 == 1 {
                 clock.advance(30)
-                try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+                try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-2))
                 if await agent.takeRefreshRequest() { _ = await agent.tick(userRequested: true) }
                 clock.advance(30)
             } else {
                 clock.advance(60)
             }
         }
-        XCTAssertEqual(reloads.count, 40)
-        XCTAssertEqual(reloads.count + 8, 48)
+        XCTAssertEqual(reloads.count, Int(ReloadBucket.capacity) + Int((24 * 3600 - 1) / ReloadBucket.refill))
+        XCTAssertLessThanOrEqual(reloads.count, ReloadScheduler.dailyCap)
+        XCTAssertLessThanOrEqual(reloads.count + 8, 55)
     }
 }
 
@@ -791,7 +895,7 @@ final class WriterAgentTests: XCTestCase {
         let clock = ManualClock(start)
         let first = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp })
         for _ in 0..<5 { _ = await first.tick(); clock.advance(60) }
-        let request = try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-6))
+        let request = try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         XCTAssertEqual(request.afterSnapshot, 5)
         try FileManager.default.removeItem(at: snapshotURL(dir))
         try FileManager.default.removeItem(at: dir.appendingPathComponent(WriterStateStore.fileName))
@@ -850,5 +954,34 @@ final class AlternatingRunner: CswapRunning, @unchecked Sendable {
             return count % 2 == 0 ? 30 : 20
         }
         return .success(RunOutput(exitCode: 0, stdout: listJSON([("1", true, pct)])))
+    }
+}
+
+/// Turns a test's slow steps on and off.
+final class SlowSteps: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var on: Bool {
+        get { lock.withLock { value } }
+        set { lock.withLock { value = newValue } }
+    }
+}
+
+/// A cswap run that takes `seconds` on the manual clock while slow steps
+/// are on.
+final class SlowRunner: CswapRunning, @unchecked Sendable {
+    let clock: ManualClock
+    let slow: SlowSteps
+    let seconds: TimeInterval
+
+    init(clock: ManualClock, slow: SlowSteps, seconds: TimeInterval) {
+        self.clock = clock
+        self.slow = slow
+        self.seconds = seconds
+    }
+
+    func runList() async -> Result<RunOutput, RunFailure> {
+        if slow.on { clock.advance(seconds) }
+        return .success(RunOutput(exitCode: 0, stdout: listJSON([("1", true, 20)])))
     }
 }

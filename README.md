@@ -124,9 +124,17 @@ codex app-server, at most 8 a day
   - the shown numbers about to pass their provider's stale line (two
     hours for Claude, four for Codex) while newer ones exist is an ordinary
     change;
-  - never more than 40 requests in any 24 hours, the low end of WidgetKit's
-    range; with the widget's own 3 hour fallback (8 a day) the worst day is
-    48.
+  - every request takes a token from a bucket that holds at most 6 and
+    gains one every 36 minutes (40 a day); with none, the change waits for
+    the next token. A busy afternoon spends the saved tokens and then one
+    every 36 minutes, so the night still gets reloads (a fixed 40 in 24
+    hours used to run out by evening and leave the widget hours behind
+    overnight). A press's completion reload may borrow one token from an
+    empty bucket (one debt at most, repaid by the next refill), so a press
+    that worked always redraws. At most 47 in any 24 hours, a ceiling kept
+    as a backstop; with the widget's own 3 hour fallback (8 a day) the
+    worst day is 55.
+    The status window shows the tokens and when the next one arrives.
 
   Ages use the continuous clock within a boot, so wall clock changes neither
   erase nor invent time. Its memory lives in `reload-state.json`, so a
@@ -139,29 +147,42 @@ codex app-server, at most 8 a day
   answers with an immediate `cswap list --json` and a new snapshot. The
   reload WidgetKit makes after the intent is the press's own and is not
   budgeted. Only when the answer is written too late for the intent to see
-  it (4.75 seconds or more after the press) does the agent add one
-  completion reload, at most one every 10 minutes, which counts toward
-  the 40 and obeys the conservative hour; at the cap it simply does not
-  go. A press never runs the background scheduler. Presses are
+  it (24.75 seconds or more after the press, judged once the answer is
+  written) does the agent add one completion reload, at most one every 10
+  minutes, which takes a token (borrowing one from an empty bucket, one
+  debt at most) and counts like any background reload, so presses cannot
+  push the day past WidgetKit's budget, and obeys the conservative hour;
+  while a debt is owed the background scheduler shows the press's numbers
+  with the next token. A press never runs the background scheduler. Presses are
   numbered by the intent under a random session id (a new session when the
   file is deleted or damaged), so a clock set back does not stop them;
-  presses within 30 seconds of the last one are ignored. The intent waits up to 5 seconds for the new
-  snapshot before returning, so the reload WidgetKit makes after it (not
-  budgeted) already shows the fresh numbers. Until the agent answers, for
+  presses within 30 seconds of the last one are ignored. The agent looks
+  for a press every half second. The intent waits up to 25 seconds for the
+  new snapshot before returning (longer than the slowest poll, cswap plus
+  an app-server ask to Codex of up to 20 s), and while it waits the
+  system shows the widget's numbers as being refreshed; the reload
+  WidgetKit makes after it (not budgeted) then already shows the fresh
+  numbers. Until the agent answers, for
   at most 90 seconds, the footer says "Refreshing…", then the plain "as of"
   line; a press never shows anything about limits.
   `"Usage Widget" --request-refresh` presses it from a terminal.
 - **Widget extension** (`com.vishutdhar.usagewidget.widget`): medium (the
   active account, at most three rows, then Codex on one line, then the other
   accounts one line each) and large (every account in full with Codex below,
-  its plan beside the name and "2 resets available" on the right; the
-  spacing tightens, then accounts are cut to three rows, then Claude
-  accounts are left out from the end, never the active one, and as a last
-  resort Codex is drawn on one line; it is never left out, in either size).
+  its plan beside the name and "2 resets available" on the right; when it
+  does not fit, the spacing tightens, then the stale lines move into the
+  headers ("stale 5:30 AM" where "active" sits), then accounts are cut to
+  three rows and then two (the weekly window and the busiest model), and
+  only then are Claude accounts left out from the end, never the active
+  one; as a last resort Codex is drawn on one line; it is never left out,
+  in either size).
   It only
   reads the snapshot; it never runs a process. It says "as of" the oldest
-  current measurement on screen ("as of 7:08 PM yesterday" for the day
-  before), marks an account whose numbers are over two hours old with
+  current measurement on screen that is not stale ("as of 7:08 PM
+  yesterday" for the day before), so the footer never claims a time newer
+  than a number it speaks for; stale accounts carry their own line (with
+  only stale ones shown, their oldest time; with none, when the snapshot
+  was written); it marks an account whose numbers are over two hours old with
   "stale · as of" their time under its name while its bars keep their
   colours, and shows a failing account's note with when its numbers were
   last known. A snapshot more than 5 minutes old when the widget reads it

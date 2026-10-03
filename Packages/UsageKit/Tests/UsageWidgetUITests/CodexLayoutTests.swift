@@ -52,7 +52,7 @@ final class CodexLayoutTests: XCTestCase {
         for candidate in candidates {
             XCTAssertTrue(LargeLayout.visible(in: c, shown: candidate.shown).contains { $0.id == "codex" }, "\(candidate)")
         }
-        XCTAssertEqual(candidates.last, LargeLayout.Candidate(shown: 2, collapsed: true, dense: true, compactOthers: true))
+        XCTAssertEqual(candidates.last, LargeLayout.Candidate(shown: 2, rowLimit: 2, dense: true, compactOthers: true))
         XCTAssertEqual(candidates.filter(\.compactOthers).count, 1, "only the last resort draws Codex on one line")
     }
 
@@ -137,7 +137,8 @@ final class CodexLayoutTests: XCTestCase {
         XCTAssertNil(trailing(account(nil, lastKnown: nil)), "current numbers need no note")
         var stale = account(nil, lastKnown: nil)
         stale.staleSince = fiveAgo
-        XCTAssertEqual(trailing(stale), "stale \u{00B7} " + (today ?? ""), "current but old numbers say stale")
+        XCTAssertEqual(trailing(stale), TimeText.staleTag(since: fiveAgo, relativeTo: entry, locale: english, timeZone: utc,
+                                                          calendar: calendar), "current but old numbers say stale, briefly")
         XCTAssertEqual(trailing(account("Token expired", lastKnown: nil)), "Token expired", "no time known: the note")
     }
 
@@ -183,5 +184,46 @@ final class CodexLayoutTests: XCTestCase {
         XCTAssertEqual(Accessibility.header(for: claude), "Account 1, 1@example.com, active")
         XCTAssertEqual(Accessibility.label(for: claude, locale: english, timeZone: utc, calendar: calendar, now: entry),
                        "Account 1, 1@example.com. active. 7 day 10 percent")
+    }
+
+    /// Short of height, the large widget gives up, in order: roomy spacing,
+    /// the stale line (moved into the header), rows past the two that
+    /// matter; only then an account, never the active one.
+    func testTheLargeLadderKeepsEveryAccountUntilRowsAreCutToTwo() throws {
+        let accounts = (1...3).map { i in
+            AccountUsage(id: "\(i)", label: "a\(i)@example.com", active: i == 1, fetchedAt: entry.addingTimeInterval(-3 * 3600),
+                         windows: [UsageWindow(kind: .session, name: "5h", windowSeconds: 18_000, usedPct: 10),
+                                   UsageWindow(kind: .weekly, name: "7d", windowSeconds: 604_800, usedPct: 50),
+                                   UsageWindow(kind: .model, name: "Fable", windowSeconds: 604_800, usedPct: 90)])
+        }
+        let snapshot = UsageSnapshot(writtenAt: entry.addingTimeInterval(-60), providers: [
+            ProviderUsage(provider: "claude", source: "cswap-list", status: .ok, accounts: accounts),
+            ProviderUsage(provider: "codex", source: "app-server", status: .ok, accounts: [
+                AccountUsage(id: "codex", label: "Codex", active: false, fetchedAt: entry,
+                             windows: [UsageWindow(kind: .weekly, name: "Weekly", windowSeconds: 604_800, usedPct: 30)]),
+            ]),
+        ])
+        let content = WidgetContent.make(snapshot: snapshot, at: entry)
+        let candidates = LargeLayout.candidates(in: content)
+        let all = 4
+        let firstDrop = try XCTUnwrap(candidates.firstIndex { $0.shown < all })
+        let before = candidates[..<firstDrop]
+        XCTAssertTrue(before.contains { $0.dense && !$0.staleInHeader && $0.rowLimit == .max })
+        XCTAssertTrue(before.contains { $0.dense && $0.staleInHeader && $0.rowLimit == .max })
+        XCTAssertTrue(before.contains { $0.dense && $0.staleInHeader && $0.rowLimit == 2 })
+        let order = before.map { [$0.dense ? 1 : 0, $0.staleInHeader ? 1 : 0, $0.rowLimit == 2 ? 1 : 0] }
+        XCTAssertEqual(order, order.sorted { $0.lexicographicallyPrecedes($1) }, "each step gives up more than the last")
+    }
+
+    /// A stale mark in the header takes the place of "active" (the accent
+    /// dot still marks the active account, and VoiceOver still says it).
+    func testTheHeaderStaleTagTakesThePlaceOfActive() {
+        let active = WidgetContent.Account(id: "1", label: "a@example.com", active: true, rows: [], note: nil)
+        XCTAssertEqual(AccountHeader.rightSide(of: active, tag: nil), ["active"])
+        XCTAssertEqual(AccountHeader.rightSide(of: active, tag: "stale 5:30 AM"), ["stale 5:30 AM"])
+        var codex = WidgetContent.Account(id: "codex", label: "Codex", active: false, rows: [], note: nil)
+        codex.footnote = "1 reset available"
+        XCTAssertEqual(AccountHeader.rightSide(of: codex, tag: "stale 5:30 AM"), ["1 reset available", "stale 5:30 AM"])
+        XCTAssertEqual(Accessibility.header(for: active, staleTag: "stale 5:30 AM"), "Account 1, a@example.com, stale 5:30 AM, active")
     }
 }

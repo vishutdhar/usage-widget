@@ -8,6 +8,10 @@ public struct BudgetStatus: Equatable, Sendable {
     public var requests24h: Int
     /// The earliest an ordinary change could be requested.
     public var nextOrdinary: Date
+    /// Whole tokens in the reload bucket, of `ReloadBucket.capacity`.
+    public var tokens: Int = 0
+    /// When the bucket's next token arrives; nil when it is full.
+    public var nextToken: Date?
 }
 
 public struct TickReport: Equatable, Sendable {
@@ -370,10 +374,16 @@ public actor UsageAgent {
         return true
     }
 
-    /// A press's completion reload, when its gates allow: under the cap, at
-    /// most one every 10 minutes, and inside the conservative hour when the
-    /// state cannot be saved. It counts toward the cap, starts the
-    /// background spacing, and records what it shows.
+    /// A press's completion reload, for a press whose answer came after the
+    /// intent's last look, when its gates allow: under the ceiling, a token
+    /// in the reload bucket (or one borrowed: an empty bucket lends one,
+    /// repaid by the next refill), at most one every 10 minutes, and inside
+    /// the conservative hour when the state cannot be saved. It takes the
+    /// token and counts like a background reload, so presses cannot push the
+    /// day past WidgetKit's budget; while a debt is owed it does not go, and
+    /// the change it would show is left to the background scheduler, which
+    /// shows it with the next token. It starts the background spacing and
+    /// records what it shows.
     private func completionCandidate(_ state: ReloadState, current: DisplayFingerprint, stamp: SchedulerClock,
                                      conservative: Bool) -> (state: ReloadState, id: Int, reasons: [ReloadReason])? {
         var press = state
@@ -382,6 +392,8 @@ public actor UsageAgent {
               state.lastCapExemption.map({ stamp.seconds(since: $0) >= Self.pressReloadSpacing }) ?? true,
               !conservative || (state.lastRequest.map { stamp.seconds(since: $0) >= ReloadScheduler.conservativeSpacing } ?? true)
         else { return nil }
+        // An empty bucket lends one token, so a press that worked redraws.
+        guard ReloadBucket.spend(&press, at: stamp, mayBorrow: true) else { return nil }
         let reasons = ReloadScheduler.pressReasons(state, current: current, clock: stamp)
         press.requests.append(stamp)
         press.lastRequest = stamp
@@ -514,21 +526,9 @@ public actor UsageAgent {
         // A press's completion reload waits for the snapshot write: until
         // its numbers are on disk nothing about them is saved as requested.
         var pressCandidate: (state: ReloadState, id: Int, reasons: [ReloadReason])?
-        if userRequested {
-            // A press's poll. The intent's own reload shows these numbers and
-            // is not budgeted; for a poll slower than the intent's wait the
-            // agent adds one completion reload, which WidgetKit budgets like
-            // any background reload: it counts toward the cap, starts the
-            // background spacing, and comes at most every 10 minutes. The
-            // background decision never runs inside a press.
-            // The intent looks for the answer for 5 s, every 0.25 s. A
-            // snapshot written within that sees its own unbudgeted reload,
-            // so only a later one needs the completion reload.
-            let waited = taken.map { now.timeIntervalSince($0.requestedAt) } ?? .infinity
-            if waited >= RefreshRequestStore.intentWait - RefreshRequestStore.intentPoll {
-                pressCandidate = completionCandidate(state, current: current, stamp: stamp, conservative: conservative)
-            }
-        } else {
+        if !userRequested {
+            // A press's poll never runs the background decision; whether it
+            // needs a completion reload is judged once its answer is written.
             let (decision, decided) = ReloadScheduler.decide(state, current: current, clock: stamp,
                                                              conservative: conservative)
             state = decided
@@ -559,6 +559,18 @@ public actor UsageAgent {
             return report
         }
         previous = written
+        // Lateness is judged now, with the answer on disk: cswap, Codex and
+        // the write all took their time (cswap alone may take up to 50 s).
+        // The intent looks for the answer every 0.25 s until its wait ends;
+        // a snapshot written within that is seen by its own unbudgeted
+        // reload, so only a later one needs the completion reload.
+        let answered = clock()
+        let tooLate = { (request: RefreshRequest) in
+            answered.wall.timeIntervalSince(request.requestedAt) >= RefreshRequestStore.intentWait - RefreshRequestStore.intentPoll
+        }
+        if userRequested, taken.map(tooLate) ?? true {
+            pressCandidate = completionCandidate(state, current: current, stamp: answered, conservative: conservative)
+        }
         // A press made while this poll ran (or just before it) is answered
         // by this snapshot: taking it again would run cswap once more. If
         // the answer came too late for the intent to see it, and this poll
@@ -567,9 +579,8 @@ public actor UsageAgent {
             let baseline = request.session == lastSeenRefresh.session ? lastSeenRefresh.sequence : 0
             if request.sequence > baseline, RefreshState.answers(written.mark, request) {
                 lastSeenRefresh = (request.session, request.sequence)
-                if fire == nil,
-                   now.timeIntervalSince(request.requestedAt) >= RefreshRequestStore.intentWait - RefreshRequestStore.intentPoll {
-                    pressCandidate = completionCandidate(state, current: current, stamp: stamp, conservative: conservative)
+                if fire == nil, pressCandidate == nil, tooLate(request) {
+                    pressCandidate = completionCandidate(state, current: current, stamp: answered, conservative: conservative)
                 }
             }
         }
@@ -586,9 +597,11 @@ public actor UsageAgent {
             persistState(state)
         }
         let requests24h = state.requests.filter { stamp.seconds(since: $0) < ReloadScheduler.capWindow }.count
+        let bucket = ReloadBucket.status(state, at: stamp)
         report.budget = BudgetStatus(cap: ReloadScheduler.dailyCap, requests24h: requests24h,
                                      nextOrdinary: ReloadScheduler.nextOrdinary(state, clock: stamp,
-                                                                                conservative: stateError != nil))
+                                                                                conservative: stateError != nil),
+                                     tokens: bucket.available, nextToken: bucket.nextRefill)
         report.stateError = stateError
         report.helperWarnings = helperWarnings
         report.pending = state.pending

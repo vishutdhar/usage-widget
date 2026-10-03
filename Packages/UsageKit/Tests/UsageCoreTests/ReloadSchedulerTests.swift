@@ -198,23 +198,23 @@ final class ReloadSchedulerTests: XCTestCase {
 
     // MARK: the cap
 
-    func testDailyCapIs40AndHoldsEvenUrgentChanges() {
-        XCTAssertEqual(ReloadScheduler.dailyCap, 40)
-        let requests = (0..<40).map { at(-60 - Double($0) * 30) }
+    func testTheDailyCeilingIs47AndHoldsEvenUrgentChanges() {
+        XCTAssertEqual(ReloadScheduler.dailyCap, 47, "a full bucket of 6, 40 refills and one press debt")
+        let requests = (0..<47).map { at(-60 - Double($0) * 29) }
         let state = ReloadState(lastRequest: requests[0], requested: fingerprint(), requests: requests)
         let urgent = fingerprint { $0.active = "2" }
         let held = decide(state, urgent, at(0))
         XCTAssertFalse(held.decision.fire)
         XCTAssertEqual(held.decision.hold, .cap)
-        let oldest = -60 - 39 * 30.0
+        let oldest = -60 - 46 * 29.0
         XCTAssertFalse(decide(held.state, urgent, at(oldest + 1440 - 0.1)).decision.fire)
         let fired = decide(held.state, urgent, at(oldest + 1440 + 0.1))
         XCTAssertTrue(fired.decision.fire)
-        XCTAssertEqual(fired.state.requests.count, 40)
+        XCTAssertEqual(fired.state.requests.count, 47)
     }
 
     func testFutureDatedEntriesCountTowardsTheCap() {
-        let future = (0..<40).map { SchedulerClock(wall: t0.addingTimeInterval(3600 + Double($0)), continuous: UInt64($0), boot: "old") }
+        let future = (0..<47).map { SchedulerClock(wall: t0.addingTimeInterval(3600 + Double($0)), continuous: UInt64($0), boot: "old") }
         let state = ReloadState(lastRequest: nil, requested: fingerprint(), requests: future)
         let result = decide(state, fingerprint { $0.active = "2" }, at(0))
         XCTAssertFalse(result.decision.fire)
@@ -229,13 +229,14 @@ final class ReloadSchedulerTests: XCTestCase {
         XCTAssertEqual(result.state.requests, [at(0)])
     }
 
-    /// The agent asks for at most 40 reloads a day, the low end of
-    /// WidgetKit's 40 to 70; the widget's own timeline asks at most once
-    /// every 3 hours, 8 a day. The worst day is 48.
-    func testTheCombinedBudgetIsFortyEight() {
+    /// The agent asks for 40 reloads a day steadily and at most 47 in any
+    /// 24 hours (a full bucket, the refills, one press debt); the widget's
+    /// own timeline asks at most once every 3 hours, 8 a day. The worst day
+    /// is 55, inside WidgetKit's 40 to 70.
+    func testTheCombinedBudgetIsFiftyFive() {
         let widgetOwn = Int((24 * 3600) / TimelinePlan.reloadFloor)
         XCTAssertEqual(widgetOwn, 8)
-        XCTAssertEqual(ReloadScheduler.dailyCap + widgetOwn, 48)
+        XCTAssertEqual(ReloadScheduler.dailyCap + widgetOwn, 55)
     }
 
     func testEachRequestIsNumbered() {
@@ -254,20 +255,20 @@ final class ReloadSchedulerTests: XCTestCase {
         XCTAssertEqual(ReloadScheduler.nextOrdinary(state, clock: at(5), conservative: false), at(10).wall)
         XCTAssertEqual(ReloadScheduler.nextOrdinary(state, clock: at(5), conservative: true), at(60).wall)
         XCTAssertEqual(ReloadScheduler.nextOrdinary(state, clock: at(30), conservative: false), at(30).wall, "already")
-        let full = (0..<40).map { at(-Double($0) * 30) }
+        let full = (0..<47).map { at(-Double($0) * 30) }
         state = ReloadState(lastRequest: full[0], requested: fingerprint(), requests: full)
-        XCTAssertEqual(ReloadScheduler.nextOrdinary(state, clock: at(1), conservative: false), at(-39 * 30 + 1440).wall,
+        XCTAssertEqual(ReloadScheduler.nextOrdinary(state, clock: at(1), conservative: false), at(-46 * 30 + 1440).wall,
                        "at the cap: when the oldest request leaves the day")
     }
 
-    /// A state holding more than 40 requests (from an earlier build with a
-    /// higher cap): the next request can go once enough have left the day,
-    /// with 60 in it, when the 21st oldest expires.
+    /// A state holding more than the ceiling's 47 requests (from an earlier
+    /// build with a higher cap): the next request can go once enough have
+    /// left the day, with 60 in it, when the 14th oldest expires.
     func testTheNextOrdinaryTimeOverTheCap() {
         let requests = (0..<60).map { at(-Double($0) * 20) }
         let state = ReloadState(lastRequest: requests[0], requested: fingerprint(), requests: requests)
         XCTAssertEqual(ReloadScheduler.nextOrdinary(state, clock: at(1), conservative: false),
-                       at(-Double(59 - 20) * 20 + 1440).wall)
+                       at(-Double(59 - 13) * 20 + 1440).wall)
     }
 
     /// A file from the build with the adaptive cap still reads; its budget
@@ -309,17 +310,17 @@ final class ReloadSchedulerTests: XCTestCase {
     /// against the daily cap, aged by wall time since they carry no boot id.
     func testAStateFileFromTheOlderBuildKeepsItsBudget() throws {
         let url = try temporaryDirectory().appendingPathComponent(ReloadStateStore.fileName)
-        let requests = (0..<40).map { t0.timeIntervalSince1970 - 3600 - Double($0) * 1800 }
+        let requests = (0..<47).map { t0.timeIntervalSince1970 - 3600 - Double($0) * 1700 }
         let v1: [String: Any] = ["lastRequestAt": requests[0], "pending": false, "requests": requests]
         try JSONSerialization.data(withJSONObject: v1).write(to: url)
         guard case .loaded(let migrated) = ReloadStateStore.read(from: url) else {
             return XCTFail("a version 1 file must be migrated")
         }
-        XCTAssertEqual(migrated.requests.count, 40)
+        XCTAssertEqual(migrated.requests.count, 47)
         XCTAssertNil(try XCTUnwrap(migrated.requests.first).boot)
         XCTAssertEqual(migrated.lastRequest?.wall, Date(timeIntervalSince1970: requests[0]))
         let result = decide(migrated, fingerprint { $0.active = "2" }, at(0))
-        XCTAssertFalse(result.decision.fire, "40 recent version 1 requests still block a 41st")
+        XCTAssertFalse(result.decision.fire, "a ceiling's worth of recent version 1 requests still blocks one more")
         XCTAssertEqual(result.decision.hold, .cap)
     }
 

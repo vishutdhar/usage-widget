@@ -41,4 +41,16 @@ final class TimeTextTests: XCTestCase {
                                          locale: posix, timeZone: utcZone, calendar: gregorian),
                        "Keychain locked")
     }
+
+    /// The stale mark that fits in an account's header: "stale 5:30 AM".
+    func testTheShortStaleTag() {
+        let zone = TimeZone(identifier: "UTC")!
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = zone
+        let now = utc(2026, 10, 3, 12, 11, 0)
+        XCTAssertEqual(TimeText.staleTag(since: utc(2026, 10, 3, 5, 30, 0), relativeTo: now, locale: Locale(identifier: "en_US"),
+                                         timeZone: zone, calendar: calendar), "stale 5:30\u{202F}AM")
+        XCTAssertEqual(TimeText.staleTag(since: utc(2026, 10, 2, 19, 8, 0), relativeTo: now, locale: Locale(identifier: "en_US"),
+                                         timeZone: zone, calendar: calendar), "stale 7:08\u{202F}PM yesterday")
+    }
 }

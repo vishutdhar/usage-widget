@@ -21,6 +21,10 @@ public struct ReloadState: Codable, Equatable, Sendable {
     public var lastCapExemption: SchedulerClock?
     /// The last request's number, for the reload log.
     public var lastRequestId: Int?
+    /// The reload bucket's tokens when last counted, and when that was
+    /// (`ReloadBucket`). Absent in older files: the bucket starts full.
+    public var bucketTokens: Double?
+    public var bucketAt: SchedulerClock?
 
     public init(lastRequest: SchedulerClock? = nil, requested: DisplayFingerprint? = nil, pending: Bool = false,
                 pendingSince: Date? = nil, requests: [SchedulerClock] = []) {
@@ -38,6 +42,8 @@ public struct ReloadDecision: Equatable, Sendable {
         case spacing
         /// The cap's worth of requests already in the last 24 hours.
         case cap
+        /// The reload bucket is empty until its next token.
+        case tokens
     }
 
     public var fire: Bool
@@ -50,10 +56,15 @@ public struct ReloadDecision: Equatable, Sendable {
 
 /// Spends WidgetKit's reload budget (typically 40 to 70 a day) on what a
 /// person would notice in the background: urgent and ordinary changes after
-/// 10 minutes, and never more than 40 requests in 24 hours, the low end of
-/// WidgetKit's range. Presses of the refresh button are not decided here;
-/// the agent's completion reload for a slow press counts toward the same
-/// cap. With the widget's own fallback (8 a day) the worst day is 48.
+/// 10 minutes, each taking a token from the reload bucket (`ReloadBucket`,
+/// one every 36 minutes, at most 6 saved), which paces them over the day
+/// and the night alike: 40 a day steadily, at most 47 in any 24 hours (a
+/// full bucket, a day of refills, and one token a press may borrow).
+/// `dailyCap` is that 47, a backstop that never binds while the bucket is
+/// kept (a bucket lost with an unsaved state starts full again). Presses of
+/// the refresh button are not decided here; the agent's completion reload
+/// for a slow press takes a token (or borrows one) and counts toward the
+/// same cap. With the widget's own fallback (8 a day) the worst day is 55.
 ///
 /// Ages are measured with `SchedulerClock`: a wall clock jump neither wipes
 /// the history nor fakes elapsed time, and a request dated in the future
@@ -61,7 +72,12 @@ public struct ReloadDecision: Equatable, Sendable {
 public enum ReloadScheduler {
     /// Urgent and ordinary changes alike wait this long after the last request.
     public static let spacing: TimeInterval = 10 * 60
-    public static let dailyCap = 40
+    /// The most the bucket can give in 24 hours: a full bucket, a day of
+    /// refills, and the one token a press may borrow. A lower count would
+    /// cut in at the end of a busy day and starve the night, as the fixed
+    /// count of 40 did.
+    public static let dailyCap = Int(ReloadBucket.capacity) + Int(capWindow / ReloadBucket.refill)
+        + Int(ReloadBucket.maxDebt)
     /// While the scheduler's memory cannot be saved, every class waits this long.
     public static let conservativeSpacing: TimeInterval = 60 * 60
 
@@ -88,6 +104,10 @@ public enum ReloadScheduler {
             let age = ages[ages.count - dailyCap]
             ready = max(ready, clock.wall.addingTimeInterval(capWindow - age))
         }
+        if ReloadBucket.tokens(state, at: clock) < 1 - ReloadBucket.slack,
+           let token = ReloadBucket.nextToken(state, at: clock) {
+            ready = max(ready, token)
+        }
         return ready
     }
     public static let capWindow: TimeInterval = 24 * 3600
@@ -113,14 +133,16 @@ public enum ReloadScheduler {
         let spacing = conservative ? conservativeSpacing : Self.spacing
         let spaced = state.lastRequest.map { clock.seconds(since: $0) >= spacing } ?? true
         let underCap = next.requests.count < dailyCap
+        let hasToken = ReloadBucket.tokens(next, at: clock) >= 1 - ReloadBucket.slack
 
-        guard spaced, underCap else {
+        guard spaced, underCap, hasToken else {
             next.pending = true
             next.pendingSince = state.pending ? (state.pendingSince ?? clock.wall) : clock.wall
-            let hold: ReloadDecision.Hold = underCap ? .spacing : .cap
+            let hold: ReloadDecision.Hold = !underCap ? .cap : (!spaced ? .spacing : .tokens)
             return (ReloadDecision(fire: false, reasons: reasons, urgent: urgent, hold: hold), next)
         }
 
+        ReloadBucket.spend(&next, at: clock)
         next.lastRequest = clock
         next.requested = current
         next.requests.append(clock)
@@ -212,5 +234,66 @@ public enum ReloadStateStore {
         decoder.nonConformingFloatDecodingStrategy = .convertFromString(
             positiveInfinity: "inf", negativeInfinity: "-inf", nan: "nan")
         return decoder
+    }
+}
+
+/// Paces background reloads: a bucket of at most `capacity` tokens, one
+/// more every `refill` (40 a day). Every background reload (ordinary,
+/// urgent, or a slow press's completion) takes one; with none, it waits.
+/// A busy afternoon spends the saved tokens and then one every 36 minutes,
+/// so the night still gets reloads; under a fixed daily count it would
+/// spend them all by evening and leave the night with none.
+///
+/// A press's completion reload may borrow: it may take the bucket one
+/// token into debt (never more), so a press that worked always redraws;
+/// the next refill repays it. Background reloads never borrow.
+///
+/// Refill is measured with `SchedulerClock`: a wall clock change neither
+/// hands out nor takes away tokens. A state without a bucket (new, or from
+/// an older build) starts full.
+public enum ReloadBucket {
+    public static let capacity: Double = 6
+    public static let refill: TimeInterval = 36 * 60
+    /// At most this many tokens owed, by a press's completion reload.
+    public static let maxDebt: Double = 1
+    /// Rounding slack, so a bucket refilled to exactly one token has one.
+    static let slack = 1e-9
+
+    public static func tokens(_ state: ReloadState, at clock: SchedulerClock) -> Double {
+        guard let saved = state.bucketTokens, saved.isFinite, let at = state.bucketAt else { return capacity }
+        return min(capacity, max(-maxDebt, saved) + clock.seconds(since: at) / refill)
+    }
+
+    /// Takes a token when there is one. With `mayBorrow` (a press's
+    /// completion reload) an empty bucket lends one, unless a debt is
+    /// still owed.
+    @discardableResult
+    public static func spend(_ state: inout ReloadState, at clock: SchedulerClock, mayBorrow: Bool = false) -> Bool {
+        let now = tokens(state, at: clock)
+        guard now >= (mayBorrow ? 1 - maxDebt : 1) - slack else { return false }
+        state.bucketTokens = max(-maxDebt, now - 1)
+        state.bucketAt = clock
+        return true
+    }
+
+    /// When the next usable token arrives (a debt is repaid first); nil
+    /// when the bucket is full.
+    public static func nextToken(_ state: ReloadState, at clock: SchedulerClock) -> Date? {
+        let now = tokens(state, at: clock)
+        guard now < capacity - slack else { return nil }
+        let target = now < 1 - slack ? 1 : floor(now + slack) + 1
+        return clock.wall.addingTimeInterval((target - now) * refill)
+    }
+
+    /// What the status window shows.
+    public struct Status: Equatable, Sendable {
+        /// Whole tokens in the bucket now.
+        public var available: Int
+        /// When the next one arrives; nil when the bucket is full.
+        public var nextRefill: Date?
+    }
+
+    public static func status(_ state: ReloadState, at clock: SchedulerClock) -> Status {
+        Status(available: max(0, Int(floor(tokens(state, at: clock) + slack))), nextRefill: nextToken(state, at: clock))
     }
 }

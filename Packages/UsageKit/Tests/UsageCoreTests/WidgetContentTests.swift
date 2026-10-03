@@ -30,7 +30,7 @@ final class WidgetContentTests: XCTestCase {
         XCTAssertEqual(try accounts[at: 0].rows.map(\.percentText), ["20%", "80%", "100%"])
         XCTAssertEqual(try accounts[at: 0].rows.map(\.level), [.ok, .warn, .over])
         XCTAssertNil(try accounts[at: 0].note)
-        XCTAssertEqual(WidgetContent.asOf(of: accounts), utc(2026, 1, 15, 9, 58, 0), "the oldest of the three shown")
+        XCTAssertEqual(WidgetContent.asOf(of: accounts), accounts.compactMap(\.measuredAt).min(), "the oldest of the three shown")
     }
 
     func testErrorReasonTravelsWithTheLastKnownData() throws {
@@ -104,13 +104,51 @@ final class WidgetContentTests: XCTestCase {
     }
 
     /// The footer speaks only for the accounts on screen: one the layout
-    /// left out, measured yesterday, does not drag it back.
+    /// left out, measured earlier, does not drag it back.
     func testAsOfCountsOnlyTheAccountsShown() throws {
         var snapshot = try sampleSnapshot()
-        snapshot.providers[0].accounts[2].fetchedAt = utc(2026, 1, 14, 9, 0, 0)
+        snapshot.providers[0].accounts[2].fetchedAt = utc(2026, 1, 15, 9, 30, 0)
         let accounts = try WidgetContent.make(snapshot: snapshot, at: now).sections[at: 0].accounts
-        XCTAssertEqual(WidgetContent.asOf(of: Array(accounts.prefix(2))), utc(2026, 1, 15, 10, 0, 0))
-        XCTAssertEqual(WidgetContent.asOf(of: accounts), utc(2026, 1, 14, 9, 0, 0))
+        let firstTwo = Array(accounts.prefix(2))
+        XCTAssertEqual(WidgetContent.asOf(of: firstTwo), firstTwo.compactMap(\.measuredAt).min())
+        XCTAssertEqual(WidgetContent.asOf(of: accounts), utc(2026, 1, 15, 9, 30, 0))
+    }
+
+    /// The footer never claims a time newer than any number it speaks
+    /// for: the oldest measurement among the shown current accounts that
+    /// are not stale. A stale account carries its own "stale · as of" line
+    /// and is left out; one with a note has its own "last known" time.
+    func testTheFooterIsTheOldestFreshMeasurement() {
+        func account(_ id: String, measured: Date, stale: Bool = false, note: String? = nil) -> WidgetContent.Account {
+            var a = WidgetContent.Account(id: id, label: id, active: false, rows: [UsageDisplay.row(
+                for: UsageWindow(kind: .weekly, name: "7d", windowSeconds: 604_800, usedPct: 10), at: now)],
+                note: note, measuredAt: measured, current: note == nil)
+            if stale { a.staleSince = measured }
+            return a
+        }
+        let fresh = account("1", measured: utc(2026, 1, 15, 10, 0, 0))
+        let older = account("2", measured: utc(2026, 1, 15, 9, 58, 0))
+        let stale = account("3", measured: utc(2026, 1, 15, 5, 30, 0), stale: true)
+        let noted = account("4", measured: utc(2026, 1, 15, 4, 0, 0), note: "Log in again")
+        let footer = WidgetContent.asOf(of: [fresh, older, stale, noted])
+        XCTAssertEqual(footer, utc(2026, 1, 15, 9, 58, 0))
+        XCTAssertLessThanOrEqual(footer ?? .distantFuture, older.measuredAt ?? .distantPast)
+        XCTAssertEqual(WidgetContent.asOf(of: [stale]), utc(2026, 1, 15, 5, 30, 0),
+                       "only stale accounts: their oldest time, never newer than what is shown")
+    }
+
+    /// With no measurement among the shown accounts (none, or none current)
+    /// the footer is when the agent last wrote the snapshot.
+    func testWithNoMeasurementTheFooterIsTheWriteTime() throws {
+        let written = utc(2026, 1, 15, 11, 0, 0)
+        let snapshot = UsageSnapshot(writtenAt: written, providers: [
+            ProviderUsage(provider: "claude", source: "cswap-list", status: .error, error: "cswap not found", accounts: []),
+        ])
+        let content = WidgetContent.make(snapshot: snapshot, at: now)
+        XCTAssertEqual(content.footerTime(for: []), written)
+        let measured = try WidgetContent.make(snapshot: sampleSnapshot(), at: now)
+        let shown = try measured.sections[at: 0].accounts
+        XCTAssertEqual(measured.footerTime(for: shown), WidgetContent.asOf(of: shown))
     }
 
     func testCompactRowsKeepFiveHourSevenDayAndTheBusiestModel() {
@@ -131,6 +169,24 @@ final class WidgetContentTests: XCTestCase {
         XCTAssertEqual(compact.hidden, 8)
         XCTAssertEqual(account.compactRows(limit: .max).rows.count, 11)
         XCTAssertEqual(account.compactRows(limit: .max).hidden, 0)
+    }
+
+    /// Cut to two rows: the weekly window and the busiest model, the two
+    /// that say how much of the week is left; to one, the weekly.
+    func testTwoRowsKeepTheWeeklyAndTheBusiestModel() {
+        let now = utc(2026, 9, 27)
+        let windows = [
+            UsageWindow(kind: .session, name: "5h", windowSeconds: 18_000, usedPct: 10),
+            UsageWindow(kind: .weekly, name: "7d", windowSeconds: 604_800, usedPct: 50),
+            UsageWindow(kind: .model, name: "Fable", windowSeconds: 604_800, usedPct: 95),
+            UsageWindow(kind: .model, name: "Other", windowSeconds: 604_800, usedPct: 20),
+        ]
+        let account = WidgetContent.account(from: AccountUsage(id: "1", label: "a", active: true, fetchedAt: now,
+                                                               windows: windows), at: now, provider: "claude")
+        XCTAssertEqual(account.compactRows(limit: 2).rows.map(\.label), ["7d", "Fable"])
+        XCTAssertEqual(account.compactRows(limit: 2).hidden, 2)
+        XCTAssertEqual(account.compactRows(limit: 1).rows.map(\.label), ["7d"])
+        XCTAssertEqual(account.compactRows(limit: 3).rows.map(\.label), ["5h", "7d", "Fable"], "three keep the 5 hour")
     }
 
     func testCompactRowsTopUpWhenThereIsNoSessionOrWeekly() {

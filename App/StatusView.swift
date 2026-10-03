@@ -1,5 +1,6 @@
 import SwiftUI
 import UsageAgentCore
+import UsageCore
 
 /// The agent's only window: when it last wrote, what went wrong, whether
 /// Codex is shown, and whether it starts at login.
@@ -32,8 +33,15 @@ struct StatusView: View {
                         .foregroundStyle(.secondary)
                 }
                 if let budget = controller.budget {
-                    LabeledContent("Reload cap") {
-                        Text("\(budget.cap) a day").monospacedDigit()
+                    LabeledContent("Reload tokens") {
+                        Text("\(budget.tokens) of \(Int(ReloadBucket.capacity))").monospacedDigit()
+                    }
+                    LabeledContent("Next token") {
+                        if let next = budget.nextToken {
+                            Text(next.formatted(date: .omitted, time: .shortened))
+                        } else {
+                            Text("Full").foregroundStyle(.secondary)
+                        }
                     }
                     LabeledContent("Reloads in the last day") {
                         Text("\(budget.requests24h)").monospacedDigit()

@@ -44,15 +44,26 @@ public struct UsageWidgetView: View {
     /// prove that even the fullest account fits, footer control included.
     static func tightestLayout(content: WidgetContent, size: UsageWidgetSize,
                                refreshControl: AnyView? = AnyView(RefreshButtonLabel())) -> some View {
+        let count = size == .medium ? MediumLayout.candidates(in: content).count : LargeLayout.candidates(in: content).count
+        return candidateLayout(content: content, size: size, index: max(0, count - 1), refreshControl: refreshControl)
+    }
+
+    /// One candidate layout of this size, as the widget's ViewThatFits
+    /// tries it, footer control included. Tests measure each to find the
+    /// one the widget picks.
+    static func candidateLayout(content: WidgetContent, size: UsageWidgetSize, index: Int,
+                                refreshControl: AnyView? = AnyView(RefreshButtonLabel())) -> some View {
         WidgetFrame(content: content, size: size) {
             switch size {
             case .medium:
-                if let last = MediumLayout.candidates(in: content).last {
-                    MediumLayout(content: content, candidate: last)
+                let candidates = MediumLayout.candidates(in: content)
+                if candidates.indices.contains(index) {
+                    MediumLayout(content: content, candidate: candidates[index])
                 }
             case .large:
-                if let last = LargeLayout.candidates(in: content).last {
-                    LargeLayout(content: content, candidate: last)
+                let candidates = LargeLayout.candidates(in: content)
+                if candidates.indices.contains(index) {
+                    LargeLayout(content: content, candidate: candidates[index])
                 }
             }
         }
@@ -69,7 +80,9 @@ public struct RefreshButtonLabel: View {
             .font(.system(size: 10, weight: .semibold))
             .foregroundStyle(.secondary)
             .frame(width: 14, height: 12)  // no taller than the footer text
-            .contentShape(Rectangle())
+            // Clickable a little past the arrow, without moving it: a click
+            // just beside it would open the app instead.
+            .contentShape(Rectangle().inset(by: -6))
             .accessibilityLabel("Refresh")
     }
 }
@@ -181,30 +194,43 @@ struct MediumLayout: View {
     let visibleOthers: Int
     /// Rows drawn for the featured account before "+N more".
     var featuredRows = 3
+    /// The featured account's stale mark in its header, not on a line.
+    var staleInHeader = false
 
     struct Candidate: Equatable {
         var visibleOthers: Int
         var featuredRows: Int
+        var staleInHeader = false
     }
 
-    init(content: WidgetContent, visibleOthers: Int, featuredRows: Int = 3) {
+    init(content: WidgetContent, visibleOthers: Int, featuredRows: Int = 3, staleInHeader: Bool = false) {
         self.content = content
         self.visibleOthers = visibleOthers
         self.featuredRows = featuredRows
+        self.staleInHeader = staleInHeader
     }
 
     init(content: WidgetContent, candidate: Candidate) {
-        self.init(content: content, visibleOthers: candidate.visibleOthers, featuredRows: candidate.featuredRows)
+        self.init(content: content, visibleOthers: candidate.visibleOthers, featuredRows: candidate.featuredRows,
+                  staleInHeader: candidate.staleInHeader)
     }
 
-    /// The layouts to try: every other account, then fewer, never below the
-    /// other providers' lines (Codex); then, only if that still does not
-    /// fit, the featured account cut to two rows and then one.
+    /// The layouts to try: every other account, first with the featured
+    /// account's stale line and then with it moved into its header; then
+    /// fewer other accounts, never below the other providers' lines
+    /// (Codex); then, only if that still does not fit, the featured
+    /// account cut to two rows and then one.
     static func candidates(in content: WidgetContent) -> [Candidate] {
         let fewest = fewestOthers(in: content)
-        var list = (fewest...others(in: content).count).reversed().map { Candidate(visibleOthers: $0, featuredRows: 3) }
+        let stale = featured(in: content)?.hasStaleLine ?? false
+        var list: [Candidate] = []
+        for visible in (fewest...others(in: content).count).reversed() {
+            if list.isEmpty || !stale { list.append(Candidate(visibleOthers: visible, featuredRows: 3)) }
+            if stale { list.append(Candidate(visibleOthers: visible, featuredRows: 3, staleInHeader: true)) }
+        }
         if fewest > 0 {
-            list += [Candidate(visibleOthers: fewest, featuredRows: 2), Candidate(visibleOthers: fewest, featuredRows: 1)]
+            list += [Candidate(visibleOthers: fewest, featuredRows: 2, staleInHeader: stale),
+                     Candidate(visibleOthers: fewest, featuredRows: 1, staleInHeader: stale)]
         }
         return list
     }
@@ -219,7 +245,7 @@ struct MediumLayout: View {
     }
 
     static func asOf(in content: WidgetContent, visibleOthers: Int) -> Date? {
-        WidgetContent.asOf(of: shown(in: content, visibleOthers: visibleOthers))
+        content.footerTime(for: shown(in: content, visibleOthers: visibleOthers))
     }
 
     /// Codex's line comes right after the featured account, then the
@@ -248,7 +274,8 @@ struct MediumLayout: View {
         return Grid(alignment: .leading, horizontalSpacing: Style.columnSpacing, verticalSpacing: Style.rowSpacing) {
             if let featured {
                 AccountBlock(account: featured, now: content.date, rowLimit: featuredRows,
-                             reservesMarker: featured.compactRows(limit: featuredRows).rows.contains(where: \.overMarker))
+                             reservesMarker: featured.compactRows(limit: featuredRows).rows.contains(where: \.overMarker),
+                             staleInHeader: staleInHeader)
             } else {
                 NoAccountsRow()
             }
@@ -267,9 +294,10 @@ struct MediumLayout: View {
 
 /// Every account in full, in slot order, with Codex below the Claude
 /// accounts. When that does not fit, the spacing tightens to the medium
-/// widget's, then each account is cut to three rows, and then Claude
-/// accounts are left out from the end of the list, never the active one
-/// and never Codex.
+/// widget's, then stale lines move into the account headers, then each
+/// account is cut to three rows and then two (weekly and the busiest
+/// model), and only then are Claude accounts left out from the end of the
+/// list, never the active one and never Codex.
 private struct LargeBody: View {
     let content: WidgetContent
 
@@ -285,51 +313,49 @@ private struct LargeBody: View {
 
 struct LargeLayout: View {
     let content: WidgetContent
-    let shown: Int
-    let collapsed: Bool
-    /// The medium widget's spacing, for when the roomier one does not fit.
-    var dense = false
-    /// The other providers' accounts (Codex) on one line each: the last
-    /// resort, so Codex is shortened but never left out.
-    var compactOthers = false
+    let candidate: Candidate
 
     struct Candidate: Equatable {
         var shown: Int
-        var collapsed: Bool
-        var dense: Bool
-        var compactOthers: Bool
-    }
-
-    init(content: WidgetContent, shown: Int, collapsed: Bool, dense: Bool = false, compactOthers: Bool = false) {
-        self.content = content
-        self.shown = shown
-        self.collapsed = collapsed
-        self.dense = dense
-        self.compactOthers = compactOthers
+        /// Rows drawn per account before "+N more" (`Int.max`: all).
+        var rowLimit = Int.max
+        /// The medium widget's spacing, for when the roomier one does not fit.
+        var dense = false
+        /// Stale marks in the account headers, not on lines of their own.
+        var staleInHeader = false
+        /// The other providers' accounts (Codex) on one line each: the last
+        /// resort, so Codex is shortened but never left out.
+        var compactOthers = false
     }
 
     init(content: WidgetContent, candidate: Candidate) {
-        self.init(content: content, shown: candidate.shown, collapsed: candidate.collapsed, dense: candidate.dense,
-                  compactOthers: candidate.compactOthers)
+        self.content = content
+        self.candidate = candidate
     }
 
-    /// The layouts to try, roomiest first: everything in full, the same
-    /// with tighter spacing, rows cut to three while accounts are left out
-    /// down to the active one plus Codex, and last Codex on one line.
+    var shown: Int { candidate.shown }
+
+    /// The layouts to try, roomiest first, every account shown until rows
+    /// are down to two: everything in full; tighter spacing; stale lines in
+    /// the headers; rows cut to three, then two. Then accounts are left out
+    /// down to the active one plus Codex, and last Codex goes on one line.
     static func candidates(in content: WidgetContent) -> [Candidate] {
         let count = content.sections.flatMap(\.accounts).count
         let fewest = min(count, max(min(1, count), content.pinnedCount))
-        var list = [Candidate(shown: count, collapsed: false, dense: false, compactOthers: false),
-                    Candidate(shown: count, collapsed: false, dense: true, compactOthers: false)]
-        list += (fewest...count).reversed().map { Candidate(shown: $0, collapsed: true, dense: false, compactOthers: false) }
+        let stale = content.sections.flatMap(\.accounts).contains(where: \.hasStaleLine)
+        var list = [Candidate(shown: count),
+                    Candidate(shown: count, dense: true)]
+        if stale { list.append(Candidate(shown: count, dense: true, staleInHeader: true)) }
+        list.append(Candidate(shown: count, rowLimit: 3, dense: true, staleInHeader: stale))
+        list += (fewest...count).reversed().map { Candidate(shown: $0, rowLimit: 2, dense: true, staleInHeader: stale) }
         if !content.otherProviderAccounts.isEmpty {
-            list.append(Candidate(shown: fewest, collapsed: true, dense: true, compactOthers: true))
+            list.append(Candidate(shown: fewest, rowLimit: 2, dense: true, staleInHeader: stale, compactOthers: true))
         }
         return list
     }
 
     static func asOf(in content: WidgetContent, shown: Int) -> Date? {
-        WidgetContent.asOf(of: visible(in: content, shown: shown))
+        content.footerTime(for: visible(in: content, shown: shown))
     }
 
     /// The first `shown` accounts by priority, never fewer than the pinned
@@ -354,7 +380,8 @@ struct LargeLayout: View {
         // Left out accounts all belong to the featured account's provider,
         // so the "more" line closes that provider's list.
         let home = content.homeSection?.provider
-        let limit = collapsed ? 3 : Int.max
+        let limit = candidate.rowLimit
+        let dense = candidate.dense
         let reservesMarker = visible.contains { $0.compactRows(limit: limit).rows.contains(where: \.overMarker) }
         let gap = dense ? Style.denseAccountGap : Style.largeAccountGap
 
@@ -375,10 +402,11 @@ struct LargeLayout: View {
                         Color.clear.frame(height: gap)
                             .gridCellUnsizedAxes(.horizontal)
                     }
-                    if compactOthers, section.provider != home {
+                    if candidate.compactOthers, section.provider != home {
                         CompactAccountRow(account: account, now: content.date)
                     } else {
-                        AccountBlock(account: account, now: content.date, rowLimit: limit, reservesMarker: reservesMarker)
+                        AccountBlock(account: account, now: content.date, rowLimit: limit, reservesMarker: reservesMarker,
+                                     staleInHeader: candidate.staleInHeader, countsHiddenRows: limit > 2)
                     }
                 }
                 if section.provider == home, hidden > 0 {
@@ -390,28 +418,35 @@ struct LargeLayout: View {
 }
 
 /// One account: its header, its note, then its rows (cut to `rowLimit`,
-/// with a "+N more" line for the rest).
+/// with a "+N more" line for the rest). With `staleInHeader` the stale
+/// mark sits in the header ("stale 5:30 AM") instead of on its own line.
 private struct AccountBlock: View {
     let account: WidgetContent.Account
     let now: Date
     let rowLimit: Int
     let reservesMarker: Bool
+    var staleInHeader = false
+    /// "+N more" under rows cut to fit. The two row cut leaves it out: it
+    /// is there to fit every account, and the line would cost the height
+    /// the cut saves.
+    var countsHiddenRows = true
 
     var body: some View {
         let compact = account.compactRows(limit: rowLimit)
-        AccountHeader(account: account)
-        NoteRow(account: account, now: now)
+        AccountHeader(account: account, staleSince: staleInHeader && account.hasStaleLine ? account.staleSince : nil,
+                      now: now, omitted: account.omittedRows(limit: rowLimit))
+        NoteRow(account: account, now: now, staleInHeader: staleInHeader)
         ForEach(Array(compact.rows.enumerated()), id: \.offset) { _, row in
             WindowRowView(row: row, reservesMarker: reservesMarker)
         }
-        if compact.hidden > 0 {
+        if compact.hidden > 0, countsHiddenRows {
             MoreWindowsRow(count: compact.hidden)
         }
     }
 }
 
-/// The footer: "as of 12:04 PM" (when the oldest current numbers on
-/// screen were measured), "Refreshing…" while a press of the refresh
+/// The footer: "as of 12:04 PM" (when the oldest current, not stale numbers
+/// on screen were measured, never newer than any of them), "Refreshing…" while a press of the refresh
 /// button is being answered, or "Not updating" when the agent has stopped
 /// writing, with the refresh control at the right.
 struct AsOfLine: View {

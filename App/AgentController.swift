@@ -11,8 +11,10 @@ import WidgetKit
 @Observable
 final class AgentController {
     static let interval: Duration = .seconds(60)
-    /// How often the agent looks for a press of the refresh button.
-    static let refreshCheck: Duration = .seconds(2)
+    /// How often the agent looks for a press of the refresh button: often,
+    /// since the press's widget shows nothing new until it is answered (a
+    /// read of a small file).
+    static let refreshCheck: Duration = .milliseconds(500)
 
     private(set) var lastWrite: Date?
     private(set) var lastError: String?
