@@ -51,19 +51,40 @@ public struct WidgetContent: Equatable, Sendable {
         /// At most `limit` rows: the 5h window, the 7d window and the most
         /// used model window, in display order, topped up from the rest when
         /// there are fewer. `hidden` counts the rows left out.
+        /// Current numbers past their line, with no note of their own: the
+        /// account says "stale" with their time.
+        public var hasStaleLine: Bool { staleSince != nil && note == nil }
+
+        /// The rows `compactRows(limit:)` leaves out, in their own order.
+        public func omittedRows(limit: Int) -> [WindowRow] {
+            let kept = compactRows(limit: limit).rows
+            var remaining = kept
+            return rows.filter { row in
+                if let i = remaining.firstIndex(of: row) {
+                    remaining.remove(at: i)
+                    return false
+                }
+                return true
+            }
+        }
+
         public func compactRows(limit: Int) -> (rows: [WindowRow], hidden: Int) {
             guard rows.count > limit else { return (rows, 0) }
-            var picked = Set<Int>()
-            if let i = rows.firstIndex(where: { $0.kind == .session }) { picked.insert(i) }
-            if let i = rows.firstIndex(where: { $0.kind == .weekly }) { picked.insert(i) }
+            // Picked by importance, drawn in their own order: the weekly
+            // window and the busiest model say how much of the week is left,
+            // then the 5 hour window, then the rest in order.
+            var ranked: [Int] = []
+            if let i = rows.firstIndex(where: { $0.kind == .weekly }) { ranked.append(i) }
             let models = rows.indices.filter { rows[$0].kind == .model }
             // The busiest model; an unknown value never outranks a known one.
             if let i = models.max(by: { (rows[$0].level == .unknown ? -1 : rows[$0].usedPct)
                                             < (rows[$1].level == .unknown ? -1 : rows[$1].usedPct) }) {
-                picked.insert(i)
+                ranked.append(i)
             }
-            for i in rows.indices where picked.count < limit { picked.insert(i) }
-            let kept = rows.indices.filter(picked.contains).prefix(limit).map { rows[$0] }
+            if let i = rows.firstIndex(where: { $0.kind == .session }) { ranked.append(i) }
+            ranked += rows.indices.filter { !ranked.contains($0) }
+            let picked = Set(ranked.prefix(limit))
+            let kept = rows.indices.filter(picked.contains).map { rows[$0] }
             return (Array(kept), rows.count - kept.count)
         }
     }
@@ -96,6 +117,8 @@ public struct WidgetContent: Equatable, Sendable {
     public var sections: [Section]
     /// The entry's date.
     public var date: Date
+    /// When the agent wrote the snapshot; nil without one.
+    public var writtenAt: Date?
     /// What the footer says about a press of the refresh button.
     public var refreshFooter: RefreshFooter = .none
     public var refreshing: Bool { refreshFooter == .refreshing }
@@ -140,11 +163,22 @@ public struct WidgetContent: Equatable, Sendable {
         featured == nil ? 0 : 1 + otherProviderAccounts.count
     }
 
-    /// When the oldest current numbers among `accounts` were measured. The
-    /// widget passes the accounts its layout actually shows and prints
-    /// "as of" this time, which is then true of everything on screen.
+    /// When the oldest current, not stale numbers among `accounts` were
+    /// measured: the widget passes the accounts its layout actually shows
+    /// and prints "as of" this time, which is then true of every number it
+    /// speaks for and never newer than any of them. A stale account carries
+    /// its own "stale · as of" line and is left out; with only stale ones
+    /// shown, their oldest time.
     public static func asOf(of accounts: [Account]) -> Date? {
-        accounts.filter { $0.current && !$0.rows.isEmpty }.compactMap(\.measuredAt).min()
+        let current = accounts.filter { $0.current && !$0.rows.isEmpty }
+        let fresh = current.filter { $0.staleSince == nil }
+        return (fresh.isEmpty ? current : fresh).compactMap(\.measuredAt).min()
+    }
+
+    /// The footer's time for the accounts a layout shows (`asOf(of:)`), or,
+    /// with no measurement among them, when the agent last wrote the snapshot.
+    public func footerTime(for shown: [Account]) -> Date? {
+        Self.asOf(of: shown) ?? writtenAt
     }
 
     public static let unavailableNote = "Usage unavailable"
@@ -187,7 +221,9 @@ public struct WidgetContent: Equatable, Sendable {
                 }
             )
         }
-        return WidgetContent(hasSnapshot: true, sections: sections, date: date)
+        var content = WidgetContent(hasSnapshot: true, sections: sections, date: date)
+        content.writtenAt = snapshot.writtenAt
+        return content
     }
 
     static func account(from account: AccountUsage, at date: Date, provider: String, writtenAt: Date? = nil) -> Account {

@@ -3,9 +3,17 @@ import UsageCore
 
 /// The header line of one account: accent dot when active, slot number,
 /// label, the plan when the provider reports one, and on the right the
-/// footnote ("2 resets available") and "active".
+/// footnote ("2 resets available"), the stale mark when the layout put it
+/// here ("stale 5:30 AM"), and "active".
 struct AccountHeader: View {
+    @Environment(\.locale) private var locale
+    @Environment(\.timeZone) private var timeZone
+    @Environment(\.calendar) private var calendar
     let account: WidgetContent.Account
+    var staleSince: Date?
+    var now = Date()
+    /// Rows the layout left out, spoken with the header.
+    var omitted: [WindowRow] = []
 
     var body: some View {
         HStack(spacing: Style.columnSpacing) {
@@ -28,25 +36,31 @@ struct AccountHeader: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 4)
-            if let footnote = account.footnote {
-                Text(verbatim: footnote)
+            ForEach(Self.rightSide(of: account, tag: tag), id: \.self) { text in
+                Text(verbatim: text)
                     .font(Style.footnote)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-            }
-            if account.active {
-                Text("active")
-                    .font(Style.footnote)
-                    .foregroundStyle(.secondary)
+                    .fixedSize()  // the label gives way, these never truncate
             }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(Accessibility.header(for: account))
+        .accessibilityLabel(Accessibility.header(for: account, staleTag: tag, omitted: omitted, locale: locale))
         .gridCellUnsizedAxes(.horizontal)
     }
 
     /// cswap slots are numbered; other providers may use longer ids.
     private var showsNumber: Bool { account.id.count <= 3 }
+
+    /// What the header's right side says: the footnote, then the stale mark
+    /// when the layout put it here, else "active".
+    static func rightSide(of account: WidgetContent.Account, tag: String?) -> [String] {
+        [account.footnote, tag ?? (account.active ? "active" : nil)].compactMap { $0 }
+    }
+
+    private var tag: String? {
+        staleSince.map { TimeText.staleTag(since: $0, relativeTo: now, locale: locale, timeZone: timeZone, calendar: calendar) }
+    }
 }
 
 /// One window as a grid row: label, bar, over marker, percent, and the reset
@@ -131,9 +145,12 @@ struct NoteRow: View {
     @Environment(\.calendar) private var calendar
     let account: WidgetContent.Account
     let now: Date
+    /// The stale mark is in the header: only a note gets a line.
+    var staleInHeader = false
 
     var body: some View {
-        if let line = NoteRow.line(for: account, now: now, locale: locale, timeZone: timeZone, calendar: calendar) {
+        if let line = staleInHeader && account.note == nil ? nil
+            : NoteRow.line(for: account, now: now, locale: locale, timeZone: timeZone, calendar: calendar) {
             IndentedLine {
                 Text(verbatim: line)
                     .font(Style.label)
@@ -242,8 +259,9 @@ struct CompactAccountRow: View {
     static func trailingNote(for account: WidgetContent.Account, now: Date, locale: Locale, timeZone: TimeZone,
                              calendar: Calendar) -> String? {
         guard let note = account.note else {
+            // One line has room for the short mark only: "stale 5:30 AM".
             return account.staleSince.map {
-                TimeText.staleLine(since: $0, relativeTo: now, locale: locale, timeZone: timeZone, calendar: calendar)
+                TimeText.staleTag(since: $0, relativeTo: now, locale: locale, timeZone: timeZone, calendar: calendar)
             }
         }
         guard let known = account.lastKnownAt else { return note }
@@ -267,8 +285,13 @@ enum Accessibility {
         return name
     }
 
-    static func header(for account: WidgetContent.Account) -> String {
-        ([name(of: account)] + [account.footnote, account.active ? "active" : nil].compactMap { $0 })
+    /// The header as spoken; rows the layout left out are spoken here too
+    /// ("5 hour 100 percent, over limit, not shown"), so VoiceOver hears
+    /// every window whatever the layout drew.
+    static func header(for account: WidgetContent.Account, staleTag: String? = nil, omitted: [WindowRow] = [],
+                       locale: Locale = .current) -> String {
+        ([name(of: account)] + [account.footnote, staleTag, account.active ? "active" : nil].compactMap { $0 }
+            + omitted.map { label(for: $0, locale: locale) + ", not shown" })
             .joined(separator: ", ")
     }
 

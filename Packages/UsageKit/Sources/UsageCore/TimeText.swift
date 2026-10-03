@@ -20,6 +20,13 @@ public enum TimeText {
         return date.formatted(dated)
     }
 
+    /// "stale 5:30 AM": the stale mark short enough for an account's
+    /// header, when the layout has no room for the stale line.
+    public static func staleTag(since date: Date, relativeTo now: Date, locale: Locale, timeZone: TimeZone,
+                                calendar: Calendar) -> String {
+        "stale " + moment(date, relativeTo: now, locale: locale, timeZone: timeZone, calendar: calendar)
+    }
+
     /// "stale · as of 7:08 PM yesterday": numbers past their line.
     public static func staleLine(since date: Date, relativeTo now: Date, locale: Locale, timeZone: TimeZone,
                                  calendar: Calendar) -> String {

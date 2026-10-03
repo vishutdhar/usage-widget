@@ -317,6 +317,47 @@ final class RenderTests: XCTestCase {
         }
     }
 
+    /// The owner's morning widget: three Claude accounts measured hours ago
+    /// (each marked stale) beside Codex. The large widget shows every
+    /// account; the medium shows what fits. The layout picked is the first
+    /// candidate that fits, as the widget's ViewThatFits picks it.
+    func testThreeStaleAccountsAndCodexAllShowInTheLargeWidget() throws {
+        var accounts = sampleAccounts()
+        for i in accounts.indices {
+            accounts[i].fetchedAt = Self.entryDate.addingTimeInterval(-(2.5 * 3600) + Double(i) * 180)
+        }
+        var snap = snapshot(accounts)
+        snap.writtenAt = Self.entryDate.addingTimeInterval(-60)
+        snap.providers.append(codexProvider())
+        let c = WidgetContent.make(snapshot: snap, at: Self.entryDate, refresh: nil, checkedAt: Self.entryDate)
+        XCTAssertEqual(c.sections[0].accounts.filter { $0.staleSince != nil }.count, 3)
+        let chosen = try XCTUnwrap(firstFitting(c, .large))
+        let all = c.sections.flatMap(\.accounts).count
+        XCTAssertEqual(LargeLayout.visible(in: c, shown: LargeLayout.candidates(in: c)[chosen].shown).count, all,
+                       "every account shows; candidate \(chosen) was picked")
+        for scheme in [ColorScheme.light, .dark] {
+            try render(c, .medium, scheme, "medium-stale-codex")
+            try render(c, .large, scheme, "large-stale-codex")
+        }
+    }
+
+    /// The index of the first candidate layout whose height fits the size.
+    func firstFitting(_ c: WidgetContent, _ size: UsageWidgetSize) -> Int? {
+        let frame = size == .large ? Self.large : Self.medium
+        let width = frame.width - 2 * Self.margin
+        let available = frame.height - 2 * Self.margin
+        let count = size == .large ? LargeLayout.candidates(in: c).count : MediumLayout.candidates(in: c).count
+        for index in 0..<count {
+            let view = UsageWidgetView.candidateLayout(content: c, size: size, index: index)
+                .frame(width: width)
+                .fixedSize(horizontal: false, vertical: true)
+                .environment(\.locale, Self.locale)
+            let height = NSHostingController(rootView: view).sizeThatFits(in: CGSize(width: width, height: 10_000)).height
+            if height <= available { return index }
+        }
+        return nil
+    }
+
     /// Amounts and times follow the SwiftUI environment's locale, not the
     /// process's: the same content drawn for another locale looks different.
     func testFormattingFollowsTheEnvironmentLocale() throws {

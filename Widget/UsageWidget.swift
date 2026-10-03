@@ -30,5 +30,10 @@ struct UsageEntryView: View {
                                 .buttonStyle(.plain)
                                 .help("Refresh")
                         ))
+            // While a press's intent waits for the fresh snapshot (up to
+            // 25 s) WidgetKit holds reloads, so nothing on the widget could
+            // change; this lets the system show at once that its numbers are
+            // being refreshed.
+            .invalidatableContent()
     }
 }

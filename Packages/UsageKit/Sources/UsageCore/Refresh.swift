@@ -89,8 +89,12 @@ public enum RefreshRequestStore {
 
     /// - Parameter read: reads the snapshot; tests count the reads.
     /// How long the intent waits for the answering snapshot, and how often
-    /// it looks.
-    public static let intentWait: TimeInterval = 5
+    /// it looks. Long enough for the slowest poll a press makes (cswap, plus
+    /// an app-server ask to Codex of up to 20 s), so the intent's own reload,
+    /// which is free, shows the fresh numbers; under the system's limit for
+    /// an intent. While it waits the system marks the widget's numbers as
+    /// being refreshed (`invalidatableContent`).
+    public static let intentWait: TimeInterval = 25
     public static let intentPoll: TimeInterval = 0.25
 
     public static func waitForAnswer(in directory: URL, to request: RefreshRequest, timeout: TimeInterval = intentWait,
