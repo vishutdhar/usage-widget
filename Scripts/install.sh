@@ -78,13 +78,21 @@ esac
 open "$DEST"
 
 # launchd must now run the installed executable: the job's process has
-# that very file (same inode) open as its program text.
+# that very file (same device and inode) open as its program text.
+# An inode number is unique on its device only, so both are compared (lsof
+# gives the device in hex).
 job_runs_installed_copy() {
-    local pid inode
+    local pid want line dev=""
     pid="$(launchctl print "$JOB" 2>/dev/null | awk '/^\tpid = /{print $3}')"
     [ -n "$pid" ] || return 1
-    inode="$(stat -f %i "$DEST/$EXE")"
-    lsof -a -p "$pid" -d txt -Fi 2>/dev/null | grep -qx "i$inode"
+    want="$(stat -f '%d:%i' "$DEST/$EXE")"
+    while IFS= read -r line; do
+        case "$line" in
+            D*) dev=$(( ${line#D} )) ;;
+            i*) [ "$dev:${line#i}" = "$want" ] && return 0 ;;
+        esac
+    done < <(lsof -a -p "$pid" -d txt -FDi 2>/dev/null)
+    return 1
 }
 for _ in $(seq 1 "$VERIFY_TRIES"); do
     if job_runs_installed_copy; then

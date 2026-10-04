@@ -29,7 +29,17 @@ public enum LaunchDecision {
             if startedByLaunchd { return .leaveForRetry }
             return loginLaunch ? .exitQuietly : .handOverAndExit
         case .failed(let reason):
+            // launchd's copy leaves for a retry (`retryNote` logs why): staying up without polling,
+            // it would keep the job running and KeepAlive would never retry.
+            if startedByLaunchd { return .leaveForRetry }
             return .stayWithoutPolling("Could not take the agent lock: \(Redactor.redactEmails(reason))")
         }
+    }
+
+    /// What launchd's copy logs as it leaves for a retry after a lock
+    /// error, masked; nil when the lock is merely held by another copy.
+    public static func retryNote(lock: InstanceLock.Outcome.Kind) -> String? {
+        guard case .failed(let reason) = lock else { return nil }
+        return "agent lock failed: \(Redactor.redactEmails(reason)); leaving for a retry"
     }
 }

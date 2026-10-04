@@ -141,6 +141,177 @@ final class RefreshAgentTests: XCTestCase {
         XCTAssertEqual(second?.reloadReasons, [])
     }
 
+    /// A Codex app-server call can take up to its 20 s timeout: the
+    /// snapshot is dated after it, with Codex's age measured then too.
+    func testTheSnapshotIsDatedAfterTheCodexCall() async throws {
+        let dir = try makeTemporaryDirectory()
+        let clock = ManualClock(start)
+        let measured = start.addingTimeInterval(-300)
+        let codex = FakeCodex(rollout: CodexReading(source: .rollout, measuredAt: measured,
+                                                    windows: [UsageWindow(kind: .weekly, name: "Weekly",
+                                                                          windowSeconds: 604_800, usedPct: 10)]),
+                              appServer: [.failure(FetchFailure(reason: "unused"))])
+        codex.setAnswerNow {
+            clock.advance(19)
+            return .failure(FetchFailure(reason: "codex app-server did not answer within 20 s"))
+        }
+        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp },
+                               codex: codex)
+        let report = await agent.tick()
+        XCTAssertEqual(codex.appServerCalls, 1)
+        XCTAssertEqual(report.writtenAt, start.addingTimeInterval(19))
+        let snapshot = try XCTUnwrap(SnapshotStore.read(from: dir.appendingPathComponent("snapshot.json")))
+        XCTAssertEqual(snapshot.writtenAt, start.addingTimeInterval(19))
+        let age = try XCTUnwrap(snapshot.provider(CodexMerge.provider)?.accounts.first?.ageSeconds)
+        XCTAssertEqual(age, 319, accuracy: 0.001, "the rollout's age when the snapshot is dated, 19 s after the poll")
+    }
+
+    /// A wall clock set back during the Codex call does not make a rollout
+    /// reading look fresh: its age is taken when it was read, and carried
+    /// to the snapshot's time on the continuous clock.
+    func testAClockSetBackDuringTheCodexCallKeepsTheRolloutsAge() async throws {
+        let dir = try makeTemporaryDirectory()
+        let clock = ManualClock(start)
+        let codex = FakeCodex(rollout: CodexReading(source: .rollout, measuredAt: start.addingTimeInterval(-5 * 3600),
+                                                    windows: [UsageWindow(kind: .weekly, name: "Weekly",
+                                                                          windowSeconds: 604_800, usedPct: 10)]),
+                              appServer: [.failure(FetchFailure(reason: "unused"))])
+        codex.setAnswerNow {
+            clock.advance(19)
+            clock.setWall(clock.now.addingTimeInterval(-6 * 3600))
+            return .failure(FetchFailure(reason: "codex app-server did not answer within 20 s"))
+        }
+        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp },
+                               codex: codex)
+        _ = await agent.tick()
+        let snapshot = try XCTUnwrap(SnapshotStore.read(from: dir.appendingPathComponent("snapshot.json")))
+        let age = try XCTUnwrap(snapshot.provider(CodexMerge.provider)?.accounts.first?.ageSeconds)
+        XCTAssertEqual(age, 5 * 3600 + 19, accuracy: 0.001)
+    }
+
+    /// The scheduler decides on the clock after the Codex step: a poll that
+    /// starts 590 s after the last reload and ends 19 s later is past the
+    /// 10 minute spacing, and its change goes.
+    func testTheSchedulerDecidesAfterTheCodexStep() async throws {
+        let dir = try makeTemporaryDirectory()
+        let clock = ManualClock(start)
+        let reloads = Counter()
+        let slow = SlowSteps()
+        let codex = FakeCodex(rollout: nil, appServer: [.failure(FetchFailure(reason: "unused"))])
+        codex.setRolloutAt { _ in
+            if slow.on { clock.advance(19) }
+            return nil
+        }
+        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok(20), ok(55)]),
+                               reload: { reloads.increment() }, clock: { clock.stamp }, codex: codex)
+        _ = await agent.tick()
+        XCTAssertEqual(reloads.count, 1)
+        clock.advance(590)
+        slow.on = true
+        let report = await agent.tick()
+        XCTAssertEqual(reloads.count, 2, "609 s after the last request when it decides; \(report.reloadReasons)")
+    }
+
+    /// The same with the time spent in an app-server call: a restarted agent
+    /// asks Codex 590 s after the last reload, the call takes 19 s, and the
+    /// scheduler, deciding after it, lets the change go.
+    func testTheSchedulerDecidesAfterTheAppServerCall() async throws {
+        let dir = try makeTemporaryDirectory()
+        let clock = ManualClock(start)
+        let reloads = Counter()
+        let weekly = { (date: Date) in
+            CodexReading(source: .appServer, measuredAt: date,
+                         windows: [UsageWindow(kind: .weekly, name: "Weekly", windowSeconds: 604_800, usedPct: 10)])
+        }
+        let first = FakeCodex(rollout: nil, appServer: [.success(weekly(start))])
+        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok(20)]), reload: { reloads.increment() },
+                               clock: { clock.stamp }, codex: first)
+        _ = await agent.tick()
+        XCTAssertEqual(reloads.count, 1)
+        clock.advance(590)
+        let slow = FakeCodex(rollout: nil, appServer: [.success(weekly(start))])
+        slow.setAnswerNow {
+            clock.advance(19)
+            return .success(weekly(clock.now))
+        }
+        let restarted = UsageAgent(directory: dir, runner: ScriptedRunner([ok(55)]), reload: { reloads.increment() },
+                                   clock: { clock.stamp }, codex: slow)
+        _ = await restarted.tick()
+        XCTAssertEqual(slow.appServerCalls, 1)
+        XCTAssertEqual(reloads.count, 2, "609 s after the last request when it decides")
+        XCTAssertEqual(state(dir)?.lastRequest?.wall, start.addingTimeInterval(609))
+    }
+
+    /// A cached Codex reading aging through a slow, failed call: 3 h 59 min
+    /// 50 s old when the poll starts, 19 s more when the snapshot is dated,
+    /// so it is written past Codex's 4 hour line.
+    func testACachedCodexReadingAgesThroughASlowCall() async throws {
+        let dir = try makeTemporaryDirectory()
+        let clock = ManualClock(start)
+        let codex = FakeCodex(rollout: nil, appServer: [.failure(FetchFailure(reason: "unused"))])
+        let calls = Counter()
+        codex.setAnswerNow {
+            calls.increment()
+            if calls.count == 1 {
+                return .success(CodexReading(source: .appServer, measuredAt: clock.now,
+                                             windows: [UsageWindow(kind: .weekly, name: "Weekly",
+                                                                   windowSeconds: 604_800, usedPct: 10)]))
+            }
+            clock.advance(19)
+            return .failure(FetchFailure(reason: "codex app-server did not answer within 20 s"))
+        }
+        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp },
+                               codex: codex)
+        _ = await agent.tick()
+        clock.advance(4 * 3600 - 10)
+        _ = await agent.tick()
+        XCTAssertEqual(calls.count, 2, "Codex idle three hours: asked again")
+        let snapshot = try XCTUnwrap(SnapshotStore.read(from: dir.appendingPathComponent("snapshot.json")))
+        let account = try XCTUnwrap(snapshot.provider(CodexMerge.provider)?.accounts.first)
+        XCTAssertEqual(try XCTUnwrap(account.ageSeconds), 4 * 3600 + 9, accuracy: 0.001)
+        XCTAssertTrue(Staleness.isDimmed(account, writtenAt: snapshot.writtenAt, at: snapshot.writtenAt,
+                                         provider: CodexMerge.provider), "past the 4 hour line as written")
+        XCTAssertEqual(account.status, .stale)
+        XCTAssertEqual(account.statusNote, "No new reading")
+    }
+
+    /// Codex's age and the snapshot's date come from one clock reading: a
+    /// pause after it (the look for Codex on disk, say) moves neither.
+    func testCodexAgeAndTheSnapshotDateAgree() async throws {
+        let dir = try makeTemporaryDirectory()
+        let clock = ManualClock(start)
+        let measured = start.addingTimeInterval(-(4 * 3600 - 10))
+        let codex = FakeCodex(rollout: CodexReading(source: .rollout, measuredAt: measured,
+                                                    windows: [UsageWindow(kind: .weekly, name: "Weekly",
+                                                                          windowSeconds: 604_800, usedPct: 10)]),
+                              appServer: [.failure(FetchFailure(reason: "codex app-server did not answer"))])
+        let slow = SlowSteps()
+        // 7 s reading the rollout (before the shared reading), 19 s looking
+        // for Codex on disk (after it).
+        codex.setRolloutAt { _ in
+            if slow.on { clock.advance(7) }
+            return CodexReading(source: .rollout, measuredAt: measured,
+                                windows: [UsageWindow(kind: .weekly, name: "Weekly", windowSeconds: 604_800, usedPct: 10)])
+        }
+        codex.onFound = { if slow.on { clock.advance(19) } }
+        let reloads = Counter()
+        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok(20), ok(55)]), reload: { reloads.increment() },
+                               clock: { clock.stamp }, codex: codex)
+        _ = await agent.tick()
+        XCTAssertEqual(reloads.count, 1)
+        let firstRequest = try XCTUnwrap(state(dir)?.lastRequest)
+        clock.advance(590)
+        slow.on = true
+        _ = await agent.tick()
+        let snapshot = try XCTUnwrap(SnapshotStore.read(from: dir.appendingPathComponent("snapshot.json")))
+        let age = try XCTUnwrap(snapshot.provider(CodexMerge.provider)?.accounts.first?.ageSeconds)
+        XCTAssertEqual(age, snapshot.writtenAt.timeIntervalSince(measured), accuracy: 0.001,
+                       "aged to the moment the snapshot is dated")
+        XCTAssertEqual(snapshot.writtenAt, start.addingTimeInterval(597), "after the rollout read, before the look on disk")
+        XCTAssertEqual(reloads.count, 1, "the scheduler decides at the same reading: 597 s, inside the spacing")
+        XCTAssertEqual(state(dir)?.lastRequest, firstRequest)
+    }
+
     /// Whether a press's answer came too late for the intent is judged when
     /// the answer is on disk, not when cswap returned: a 15 s cswap run and
     /// a 19 s Codex read write the answer 34 s after the press, past the
