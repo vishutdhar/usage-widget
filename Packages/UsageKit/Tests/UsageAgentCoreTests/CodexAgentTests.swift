@@ -20,7 +20,12 @@ final class FakeCodex: CodexSourcing, @unchecked Sendable {
         self.cycle = cycle
     }
 
-    var codexFound: Bool { lock.withLock { found } }
+    /// Runs on each look for Codex (a file system check in the real one).
+    var onFound: (() -> Void)?
+    var codexFound: Bool {
+        onFound?()
+        return lock.withLock { found }
+    }
     var appServerCalls: Int { lock.withLock { calls } }
     func setRollout(_ reading: CodexReading?) { lock.withLock { rollout = reading } }
     func setRolloutAt(_ make: @escaping (Date) -> CodexReading?) { lock.withLock { rolloutAt = make } }

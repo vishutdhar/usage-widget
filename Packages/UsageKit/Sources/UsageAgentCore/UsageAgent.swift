@@ -135,7 +135,11 @@ public actor UsageAgent {
     }
 
     /// The codex provider block for this poll, or nil when Codex is off.
-    private func codexBlock(now stamp: SchedulerClock) async -> ProviderUsage? {
+    /// The Codex step up to its merge: the rollout read and, when the
+    /// policy allows, an app-server call. Nil while Codex is off (or turned
+    /// off during the call). The caller merges at the moment it dates the
+    /// snapshot, so Codex's age and the snapshot's date share one reading.
+    private func codexStep(now stamp: SchedulerClock) async -> (codex: any CodexSourcing, rollout: CodexReading?)? {
         guard let codex else { return nil }
         let rollout = codex.rolloutReading(now: stamp.wall)
         if CodexCallPolicy.reason(calls: codexCalls.calls, firstOfLaunch: !codexCalledThisLaunch,
@@ -149,7 +153,7 @@ public actor UsageAgent {
                 guard self.codex != nil else { return nil }
             }
         }
-        return mergeCodex(codex, rollout: rollout, stamp: stamp)
+        return (codex, rollout)
     }
 
     private func askCodexAppServer(_ codex: any CodexSourcing) async {
@@ -167,7 +171,8 @@ public actor UsageAgent {
         }
     }
 
-    private func mergeCodex(_ codex: any CodexSourcing, rollout: CodexReading?, stamp: SchedulerClock) -> ProviderUsage {
+    private func mergeCodex(_ codex: any CodexSourcing, rollout: CodexReading?, readAt stamp: SchedulerClock,
+                            now: SchedulerClock) -> ProviderUsage {
         // A rollout event replaces the cached reading only when its own time
         // is strictly newer than the cache's own time; neither is ever
         // re-dated, so a clock set back cannot let an older event in.
@@ -177,9 +182,9 @@ public actor UsageAgent {
             next.planType = rollout.planType ?? codexCurrent?.reading.planType
             codexCurrent = RememberedReading(next, at: stamp)
         }
-        return CodexMerge.block(rollout: nil, appServer: nil, lastKnown: codexCurrent?.reading(at: stamp),
+        return CodexMerge.block(rollout: nil, appServer: nil, lastKnown: codexCurrent?.reading(at: now),
                                 appServerCheckedAt: codexAppServerCheckedAt, appServerError: codexAppServerError,
-                                codexFound: codex.codexFound, now: stamp.wall)
+                                codexFound: codex.codexFound, now: now.wall)
     }
 
     /// The codex block of a snapshot as a reading, so a restart starts from
@@ -475,25 +480,33 @@ public actor UsageAgent {
         let result = await runner.runList()
         if case .success(let output) = result, output.leftHelper { helperWarnings += 1 }
         let outcome = CswapInterpreter.interpret(result)
-        let stamp = clock()
-        let now = stamp.wall
+        let polled = clock()
         var built = SnapshotBuilder.updating(
             previous,
             provider: CswapListMapper.provider,
             source: CswapListMapper.source,
             outcome: outcome,
-            now: now
+            now: polled.wall
         )
         // Codex off keeps its last block, hidden, so turning it on again (or
         // restarting) starts from those numbers.
         let keptCodex = built.providers.first { $0.provider == CodexMerge.provider }
         built.providers.removeAll { $0.provider == CodexMerge.provider }
-        if let block = await codexBlock(now: stamp) {
-            built.providers.append(block)
+        let step = await codexStep(now: polled)
+        // A Codex app-server call may have taken up to its 20 s timeout: the
+        // snapshot is dated, Codex aged, and the scheduler decides, after it,
+        // all at this one reading. The rollout is kept as of when it was
+        // read and aged on the continuous clock to here, so a wall clock
+        // change meanwhile cannot re-date it.
+        let stamp = clock()
+        let now = stamp.wall
+        if let step {
+            built.providers.append(mergeCodex(step.codex, rollout: step.rollout, readAt: polled, now: stamp))
         } else if var kept = keptCodex {
             kept.hidden = true
             built.providers.append(kept)
         }
+        built.writtenAt = now
         // A reload state problem is shown where a cswap error would be,
         // without marking the provider as failed.
         if let stateError, let index = built.providers.firstIndex(where: { $0.provider == CswapListMapper.provider }),
