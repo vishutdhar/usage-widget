@@ -81,6 +81,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let action = LaunchDecision.decide(lock: lock, loginLaunch: launchedAsLoginItem,
                                            startedByLaunchd: startedByLaunchd)
         if case .stayWithoutPolling(let message) = action { lockError = message }
+        if action == .leaveForRetry, let note = LaunchDecision.retryNote(lock: lock) {
+            // Said here: the retry's own line cannot tell an error from a holder.
+            Log.agent.error("\(note, privacy: .public)")
+        }
         carryOut(action)
 
         // Only the copy that stays (it holds the lock) observes these, so
@@ -345,7 +349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             exit(action.exitStatus ?? 0)
         case .leaveForRetry:
             // Non-zero, so KeepAlive starts launchd's copy again later.
-            Log.agent.info("launchd start while another instance holds the lock; leaving for a retry")
+            Log.agent.info("launchd start could not take the agent lock; leaving for a retry")
             exit(action.exitStatus ?? 1)
         }
     }
