@@ -341,6 +341,51 @@ final class RenderTests: XCTestCase {
         }
     }
 
+    /// Issue #11: the Claude numbers are minutes old and the Codex reading
+    /// hours old. The footer says when the Claude numbers were measured;
+    /// the Codex row says "as of" its own time.
+    func testAnOlderCodexReadingIsDatedOnItsOwnLine() throws {
+        var snap = snapshot(sampleAccounts())
+        var codex = codexProvider()
+        codex.accounts[0].fetchedAt = Self.entryDate.addingTimeInterval(-100 * 60)
+        snap.providers.append(codex)
+        let c = content(snap)
+        for scheme in [ColorScheme.light, .dark] {
+            try render(c, .medium, scheme, "medium-codex-older")
+            try render(c, .large, scheme, "large-codex-older")
+        }
+        // Under the footers that replace "as of", Codex still says its own time.
+        var refreshing = c
+        refreshing.refreshFooter = .refreshing
+        try render(refreshing, .medium, .light, "medium-refreshing-codex-older")
+        var silent = c
+        silent.notUpdating = true
+        try render(silent, .medium, .light, "medium-not-updating-codex-older")
+        // The large layout that moves stale marks into the headers keeps
+        // Codex's own line: a stale Claude account beside fresh ones.
+        var mixed = sampleAccounts()
+        mixed[1].fetchedAt = Self.entryDate.addingTimeInterval(-3 * 3600)
+        var mixedSnap = snapshot(mixed)
+        mixedSnap.writtenAt = Self.entryDate.addingTimeInterval(-60)
+        mixedSnap.providers.append(codex)
+        let mixedContent = WidgetContent.make(snapshot: mixedSnap, at: Self.entryDate, refresh: nil,
+                                              checkedAt: Self.entryDate)
+        let stepIndex = try XCTUnwrap(LargeLayout.candidates(in: mixedContent).firstIndex {
+            $0.staleInHeader && $0.rowLimit == .max
+        })
+        try render(mixedContent, .large, .light, "large-stale-header-codex-older", candidate: stepIndex)
+        // The large widget's last resort, Codex on one line, keeps the date,
+        // and still fits beside the fullest account and a provider error.
+        var fullest = snapshot(fullestAccounts(), status: .error, error: "cswap timed out after 50 s")
+        fullest.providers.append(codex)
+        let width = Self.large.width - 2 * Self.margin
+        let tightest = UsageWidgetView.tightestLayout(content: content(fullest), size: .large)
+            .frame(width: width).fixedSize(horizontal: false, vertical: true).environment(\.locale, Self.locale)
+        let height = NSHostingController(rootView: tightest).sizeThatFits(in: CGSize(width: width, height: 10_000)).height
+        XCTAssertLessThanOrEqual(height, Self.large.height - 2 * Self.margin)
+        try render(content(fullest), .large, .light, "large-last-resort-codex-older", tightest: true)
+    }
+
     /// The index of the first candidate layout whose height fits the size.
     func firstFitting(_ c: WidgetContent, _ size: UsageWidgetSize) -> Int? {
         let frame = size == .large ? Self.large : Self.medium
@@ -418,11 +463,16 @@ final class RenderTests: XCTestCase {
     /// - Parameter tightest: draw the size's last-resort layout instead of
     ///   the one the widget would pick.
     func image(_ content: WidgetContent, _ size: UsageWidgetSize, _ scheme: ColorScheme,
-               locale: Locale = RenderTests.locale, tightest: Bool = false) throws -> CGImage {
+               locale: Locale = RenderTests.locale, tightest: Bool = false, candidate: Int? = nil) throws -> CGImage {
         let frame = size == .medium ? Self.medium : Self.large
-        let body: AnyView = tightest
-            ? AnyView(UsageWidgetView.tightestLayout(content: content, size: size))
-            : AnyView(UsageWidgetView(content: content, size: size, refreshControl: AnyView(RefreshButtonLabel())))
+        let body: AnyView
+        if let candidate {
+            body = AnyView(UsageWidgetView.candidateLayout(content: content, size: size, index: candidate))
+        } else if tightest {
+            body = AnyView(UsageWidgetView.tightestLayout(content: content, size: size))
+        } else {
+            body = AnyView(UsageWidgetView(content: content, size: size, refreshControl: AnyView(RefreshButtonLabel())))
+        }
         let view = body
             .padding(Self.margin)
             .frame(width: frame.width, height: frame.height)
@@ -438,9 +488,9 @@ final class RenderTests: XCTestCase {
     }
 
     func render(_ content: WidgetContent, _ size: UsageWidgetSize, _ scheme: ColorScheme, _ name: String,
-                tightest: Bool = false) throws {
+                tightest: Bool = false, candidate: Int? = nil) throws {
         let frame = size == .medium ? Self.medium : Self.large
-        let image = try image(content, size, scheme, tightest: tightest)
+        let image = try image(content, size, scheme, tightest: tightest, candidate: candidate)
         XCTAssertEqual(image.width, Int(frame.width * 2), name)
         XCTAssertEqual(image.height, Int(frame.height * 2), name)
         XCTAssertGreaterThan(distinctColors(image), 20, "\(name) looks blank")

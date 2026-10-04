@@ -23,6 +23,9 @@ public struct WidgetContent: Equatable, Sendable {
         /// Set when the numbers are past their provider's line at this
         /// entry's date: when they were measured, for the "stale" line.
         public var staleSince: Date?
+        /// Set for another provider's account (Codex) whose current numbers
+        /// are older than the footer's time: it says "as of" its own time.
+        public var ownTime: Date?
         /// When the numbers shown were measured.
         public var measuredAt: Date?
         /// The numbers are current (status ok), so they count toward "as of".
@@ -175,10 +178,35 @@ public struct WidgetContent: Equatable, Sendable {
         return (fresh.isEmpty ? current : fresh).compactMap(\.measuredAt).min()
     }
 
-    /// The footer's time for the accounts a layout shows (`asOf(of:)`), or,
-    /// with no measurement among them, when the agent last wrote the snapshot.
+    /// The footer's time for the accounts a layout shows: when the shown
+    /// accounts of the featured account's provider (Claude) were measured
+    /// (`asOf(of:)`). Another provider's reading is often hours older (Codex
+    /// is asked at most eight times a day) and would drag the footer back;
+    /// it carries its own time instead (`markingOwnTimes`). With no numbers
+    /// from the featured provider, all shown accounts; with none at all,
+    /// when the agent last wrote the snapshot.
     public func footerTime(for shown: [Account]) -> Date? {
-        Self.asOf(of: shown) ?? writtenAt
+        let home = shown.filter { homeSection?.accounts.contains($0) ?? false }
+        return Self.asOf(of: home) ?? Self.asOf(of: shown) ?? writtenAt
+    }
+
+    /// The same content with `ownTime` set on each other provider's account
+    /// whose current numbers are older than `footer`, so no number on
+    /// screen is presented as newer than it is. Stale accounts and ones with
+    /// a note already carry their own time.
+    public func markingOwnTimes(footer: Date?) -> WidgetContent {
+        guard let footer, let home = homeSection?.provider else { return self }
+        var marked = self
+        for s in marked.sections.indices where marked.sections[s].provider != home {
+            for a in marked.sections[s].accounts.indices {
+                let account = marked.sections[s].accounts[a]
+                if account.current, !account.rows.isEmpty, account.staleSince == nil, account.note == nil,
+                   let measured = account.measuredAt, measured < footer {
+                    marked.sections[s].accounts[a].ownTime = measured
+                }
+            }
+        }
+        return marked
     }
 
     public static let unavailableNote = "Usage unavailable"

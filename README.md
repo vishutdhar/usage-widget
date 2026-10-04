@@ -178,11 +178,14 @@ codex app-server, at most 8 a day
   in either size).
   It only
   reads the snapshot; it never runs a process. It says "as of" the oldest
-  current measurement on screen that is not stale ("as of 7:08 PM
+  current Claude measurement on screen that is not stale ("as of 7:08 PM
   yesterday" for the day before), so the footer never claims a time newer
   than a number it speaks for; stale accounts carry their own line (with
-  only stale ones shown, their oldest time; with none, when the snapshot
-  was written); it marks an account whose numbers are over two hours old with
+  only stale ones shown, their oldest time). A Codex reading older than
+  that (Codex is asked at most eight times a day) says "as of" its own
+  time on its own line rather than dragging the footer back; with no
+  Claude numbers on screen the footer speaks for the others, and with none
+  at all it gives when the snapshot was written. It marks an account whose numbers are over two hours old with
   "stale · as of" their time under its name while its bars keep their
   colours, and shows a failing account's note with when its numbers were
   last known. A snapshot more than 5 minutes old when the widget reads it

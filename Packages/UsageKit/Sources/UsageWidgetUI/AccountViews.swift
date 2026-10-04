@@ -145,12 +145,12 @@ struct NoteRow: View {
     @Environment(\.calendar) private var calendar
     let account: WidgetContent.Account
     let now: Date
-    /// The stale mark is in the header: only a note gets a line.
+    /// The stale mark is in the header: it gets no line of its own.
     var staleInHeader = false
 
     var body: some View {
-        if let line = staleInHeader && account.note == nil ? nil
-            : NoteRow.line(for: account, now: now, locale: locale, timeZone: timeZone, calendar: calendar) {
+        if let line = NoteRow.shownLine(for: account, staleInHeader: staleInHeader, now: now, locale: locale,
+                                        timeZone: timeZone, calendar: calendar) {
             IndentedLine {
                 Text(verbatim: line)
                     .font(Style.label)
@@ -163,6 +163,14 @@ struct NoteRow: View {
 }
 
 extension NoteRow {
+    /// The line this row draws: with the stale mark in the header, only the
+    /// stale line is left out; a note or an "as of" own time still shows.
+    static func shownLine(for account: WidgetContent.Account, staleInHeader: Bool, now: Date, locale: Locale,
+                          timeZone: TimeZone, calendar: Calendar) -> String? {
+        staleInHeader && account.hasStaleLine ? nil
+            : line(for: account, now: now, locale: locale, timeZone: timeZone, calendar: calendar)
+    }
+
     /// The account's note with its last known time, or for current numbers
     /// past their line "stale · as of 7:08 PM yesterday"; nil otherwise.
     nonisolated static func line(for account: WidgetContent.Account, now: Date, locale: Locale, timeZone: TimeZone,
@@ -171,8 +179,12 @@ extension NoteRow {
             return TimeText.noteLine(note, lastKnownAt: account.lastKnownAt, relativeTo: now, locale: locale,
                                      timeZone: timeZone, calendar: calendar)
         }
-        return account.staleSince.map {
-            TimeText.staleLine(since: $0, relativeTo: now, locale: locale, timeZone: timeZone, calendar: calendar)
+        if let since = account.staleSince {
+            return TimeText.staleLine(since: since, relativeTo: now, locale: locale, timeZone: timeZone, calendar: calendar)
+        }
+        // Older than the footer says: "as of" its own time.
+        return account.ownTime.map {
+            TimeText.asOf($0, relativeTo: now, locale: locale, timeZone: timeZone, calendar: calendar)
         }
     }
 }
@@ -260,8 +272,13 @@ struct CompactAccountRow: View {
                              calendar: Calendar) -> String? {
         guard let note = account.note else {
             // One line has room for the short mark only: "stale 5:30 AM".
-            return account.staleSince.map {
-                TimeText.staleTag(since: $0, relativeTo: now, locale: locale, timeZone: timeZone, calendar: calendar)
+            if let since = account.staleSince {
+                return TimeText.staleTag(since: since, relativeTo: now, locale: locale, timeZone: timeZone,
+                                         calendar: calendar)
+            }
+            // Older than the footer says: "as of" its own time.
+            return account.ownTime.map {
+                TimeText.asOf($0, relativeTo: now, locale: locale, timeZone: timeZone, calendar: calendar)
             }
         }
         guard let known = account.lastKnownAt else { return note }
