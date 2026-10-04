@@ -67,13 +67,121 @@ final class CodexLayoutTests: XCTestCase {
     }
 
     /// "as of" covers the Codex numbers whenever the layout shows them.
-    func testAsOfCoversCodex() {
-        let older = entry.addingTimeInterval(-40 * 60)
+    /// The footer speaks for the Claude rows: an older Codex reading (its
+    /// app-server is asked at most eight times a day) does not drag it back;
+    /// the Codex row carries its own time instead, so no number is shown as
+    /// newer than it is (issue #11: Claude 7:03 PM, Codex 5:24 PM, footer
+    /// "as of 5:24 PM").
+    func testAnOlderCodexReadingCarriesItsOwnTime() {
+        let older = entry.addingTimeInterval(-100 * 60)
         let c = content(codexMeasured: older)
         XCTAssertEqual(MediumLayout.asOf(in: c, visibleOthers: 0), entry)
-        XCTAssertEqual(MediumLayout.asOf(in: c, visibleOthers: 1), older)
-        XCTAssertEqual(LargeLayout.asOf(in: c, shown: 4), older)
-        XCTAssertEqual(LargeLayout.asOf(in: c, shown: 1), older, "Codex is on every large layout")
+        XCTAssertEqual(MediumLayout.asOf(in: c, visibleOthers: 1), entry)
+        XCTAssertEqual(LargeLayout.asOf(in: c, shown: 4), entry)
+        XCTAssertEqual(LargeLayout.asOf(in: c, shown: 1), entry)
+        let marked = c.markingOwnTimes(footer: entry)
+        let codex = try! XCTUnwrap(marked.otherProviderAccounts.first)
+        XCTAssertEqual(codex.ownTime, older)
+        XCTAssertEqual(NoteRow.line(for: codex, now: entry, locale: english, timeZone: utc, calendar: calendar),
+                       TimeText.asOf(older, relativeTo: entry, locale: english, timeZone: utc, calendar: calendar))
+        XCTAssertEqual(CompactAccountRow.trailingNote(for: codex, now: entry, locale: english, timeZone: utc,
+                                                      calendar: calendar),
+                       TimeText.asOf(older, relativeTo: entry, locale: english, timeZone: utc, calendar: calendar))
+        XCTAssertTrue(marked.sections[0].accounts.allSatisfy { $0.ownTime == nil }, "the footer speaks for these")
+        // Every number on screen: no newer than the footer says, or dated itself.
+        for account in marked.sections.flatMap(\.accounts) {
+            XCTAssertTrue((account.measuredAt.map { $0 >= entry } ?? true) || account.ownTime != nil
+                          || account.staleSince != nil || account.note != nil, account.id)
+        }
+        // A Codex reading as new as the footer needs no line of its own.
+        XCTAssertNil(content().markingOwnTimes(footer: entry).otherProviderAccounts.first?.ownTime)
+    }
+
+    /// Every layout either size may pick dates the older Codex reading,
+    /// including those that move stale marks into the headers: the stale
+    /// line moves, the Codex "as of" line stays.
+    func testEveryLayoutDatesAnOlderCodexReading() {
+        let older = entry.addingTimeInterval(-100 * 60)
+        let c = content(codexMeasured: older)
+        for candidate in LargeLayout.candidates(in: c) {
+            let laid = LargeLayout(content: c, candidate: candidate).content
+            XCTAssertEqual(laid.otherProviderAccounts.first?.ownTime, older, "\(candidate)")
+        }
+        for candidate in MediumLayout.candidates(in: c) {
+            let laid = MediumLayout(content: c, candidate: candidate).content
+            XCTAssertEqual(laid.otherProviderAccounts.first?.ownTime, older, "\(candidate)")
+        }
+        let codex = c.markingOwnTimes(footer: entry).otherProviderAccounts.first!
+        XCTAssertEqual(NoteRow.shownLine(for: codex, staleInHeader: true, now: entry, locale: english, timeZone: utc,
+                                         calendar: calendar),
+                       TimeText.asOf(older, relativeTo: entry, locale: english, timeZone: utc, calendar: calendar))
+        var stale = c.sections[0].accounts[0]
+        stale.staleSince = older
+        XCTAssertNil(NoteRow.shownLine(for: stale, staleInHeader: true, now: entry, locale: english, timeZone: utc,
+                                       calendar: calendar), "the stale mark is in the header")
+        XCTAssertNotNil(NoteRow.shownLine(for: stale, staleInHeader: false, now: entry, locale: english, timeZone: utc,
+                                          calendar: calendar))
+        var noted = codex
+        noted.ownTime = nil
+        noted.note = "No new reading"
+        noted.lastKnownAt = older
+        XCTAssertEqual(NoteRow.shownLine(for: noted, staleInHeader: true, now: entry, locale: english, timeZone: utc,
+                                         calendar: calendar),
+                       TimeText.noteLine("No new reading", lastKnownAt: older, relativeTo: entry, locale: english,
+                                         timeZone: utc, calendar: calendar), "a note keeps its line and its time")
+    }
+
+    /// Each layout dates against its own footer: Claude A at noon, B at 10:00,
+    /// Codex at 11:00. Showing B, the footer is 10:00 and Codex needs no
+    /// line; leaving B out, the footer is noon and Codex says "as of 11:00".
+    func testEachLayoutDatesAgainstItsOwnFooter() {
+        let noon = entry, ten = entry.addingTimeInterval(-2 * 3600), eleven = entry.addingTimeInterval(-3600)
+        func claude(_ id: String, _ measured: Date) -> AccountUsage {
+            AccountUsage(id: id, label: "\(id)@example.com", active: id == "1", fetchedAt: measured, windows: [
+                UsageWindow(kind: .weekly, name: "7d", windowSeconds: 604_800, usedPct: 10),
+            ])
+        }
+        let snapshot = UsageSnapshot(writtenAt: entry, providers: [
+            ProviderUsage(provider: "claude", source: "cswap-list", status: .ok,
+                          accounts: [claude("1", noon), claude("2", ten)]),
+            ProviderUsage(provider: "codex", source: "rollout", status: .ok, accounts: [
+                AccountUsage(id: "codex", label: "Codex", active: false, fetchedAt: eleven, windows: [
+                    UsageWindow(kind: .weekly, name: "Weekly", windowSeconds: 604_800, usedPct: 35),
+                ]),
+            ]),
+        ])
+        let c = WidgetContent.make(snapshot: snapshot, at: entry)
+        XCTAssertEqual(LargeLayout.asOf(in: c, shown: 3), ten)
+        XCTAssertNil(LargeLayout(content: c, candidate: .init(shown: 3)).content.otherProviderAccounts.first?.ownTime)
+        XCTAssertEqual(LargeLayout.asOf(in: c, shown: 2), noon)
+        XCTAssertEqual(LargeLayout(content: c, candidate: .init(shown: 2)).content.otherProviderAccounts.first?.ownTime,
+                       eleven)
+        XCTAssertEqual(MediumLayout.asOf(in: c, visibleOthers: 1), noon)
+        XCTAssertEqual(MediumLayout(content: c, visibleOthers: 1).content.otherProviderAccounts.first?.ownTime, eleven)
+        XCTAssertEqual(MediumLayout.asOf(in: c, visibleOthers: 2), ten)
+        XCTAssertNil(MediumLayout(content: c, visibleOthers: 2).content.otherProviderAccounts.first?.ownTime)
+        // Spoken too: the Codex row's label carries its own time.
+        let codex = MediumLayout(content: c, visibleOthers: 1).content.otherProviderAccounts.first!
+        XCTAssertTrue(Accessibility.label(for: codex, locale: english, timeZone: utc, calendar: calendar, now: entry)
+            .contains(TimeText.asOf(eleven, relativeTo: entry, locale: english, timeZone: utc, calendar: calendar)))
+    }
+
+    /// With no cswap numbers on screen, the footer falls back to the others..
+    func testWithoutCswapNumbersTheFooterIsTheOthers() {
+        let older = entry.addingTimeInterval(-100 * 60)
+        let snapshot = UsageSnapshot(writtenAt: entry, providers: [
+            ProviderUsage(provider: "claude", source: "cswap-list", status: .error, error: "cswap not found", accounts: [
+                AccountUsage(id: "1", label: "a@example.com", active: true, fetchedAt: entry, windows: []),
+            ]),
+            ProviderUsage(provider: "codex", source: "rollout", status: .ok, accounts: [
+                AccountUsage(id: "codex", label: "Codex", active: false, fetchedAt: older, windows: [
+                    UsageWindow(kind: .weekly, name: "Weekly", windowSeconds: 604_800, usedPct: 35),
+                ]),
+            ]),
+        ])
+        let c = WidgetContent.make(snapshot: snapshot, at: entry)
+        XCTAssertEqual(LargeLayout.asOf(in: c, shown: 2), older)
+        XCTAssertNil(c.markingOwnTimes(footer: older).otherProviderAccounts.first?.ownTime)
     }
 
     func withErrors(claude: String?, codex: String?, claudeAccounts: Bool = true) -> WidgetContent {

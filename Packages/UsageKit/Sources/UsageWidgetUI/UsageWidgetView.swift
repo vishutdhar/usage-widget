@@ -204,7 +204,8 @@ struct MediumLayout: View {
     }
 
     init(content: WidgetContent, visibleOthers: Int, featuredRows: Int = 3, staleInHeader: Bool = false) {
-        self.content = content
+        // Accounts older than this layout's footer say so on their own line.
+        self.content = content.markingOwnTimes(footer: Self.asOf(in: content, visibleOthers: visibleOthers))
         self.visibleOthers = visibleOthers
         self.featuredRows = featuredRows
         self.staleInHeader = staleInHeader
@@ -329,7 +330,8 @@ struct LargeLayout: View {
     }
 
     init(content: WidgetContent, candidate: Candidate) {
-        self.content = content
+        // Accounts older than this layout's footer say so on their own line.
+        self.content = content.markingOwnTimes(footer: Self.asOf(in: content, shown: candidate.shown))
         self.candidate = candidate
     }
 
