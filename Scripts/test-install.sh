@@ -40,7 +40,8 @@ status=0
 fail() { echo "FAIL ($1): $2"; status=1; }
 
 # $1 old copy running outside launchd (1/0), $2 the new --register-job result
-# (0 registered, 3 left off, 4 failed), $3 launchd runs the installed file (1/0).
+# (0 registered, 3 left off, 4 failed), $3 launchd runs the installed file
+# (1), another file (0), or one with the same inode on another device (2).
 run_case() {
     local TMP
     TMP="$(make_tmp)"
@@ -102,8 +103,20 @@ echo "open" >> "$CALLS"
 STUB
     cat > "$BIN/lsof" <<STUB
 #!/bin/bash
-if [ "\$(cat "$STATE/newfile")" = 1 ]; then inode=\$(stat -f %i "$DEST/Contents/MacOS/Usage Widget"); else inode=1; fi
-printf 'p4242\nftxt\ni%s\n' "\$inode"
+# 1: the installed file; 0: another file; 2: the installed file's inode
+# number on another device (a stale copy elsewhere).
+exe="$DEST/Contents/MacOS/Usage Widget"
+dev=\$(stat -f %d "\$exe"); inode=\$(stat -f %i "\$exe")
+case "\$(cat "$STATE/newfile")" in
+    0) inode=1 ;;
+    2) dev=\$((dev + 1)) ;;
+esac
+# Prints only the fields asked for with -F, as lsof does.
+fields=""
+for arg in "\$@"; do case "\$arg" in -F*) fields="\${arg#-F}" ;; esac; done
+printf 'p4242\nftxt\n'
+case "\$fields" in *D*) printf 'D0x%x\n' "\$dev" ;; esac
+case "\$fields" in *i*) printf 'i%s\n' "\$inode" ;; esac
 STUB
     printf '#!/bin/bash\nexit 0\n' > "$BIN/pluginkit"
     printf '#!/bin/bash\nexit 0\n' > "$BIN/lsregister"
@@ -132,6 +145,9 @@ case "$CASE_CALLS" in *old*) fail upgrade "the old executable was given a flag" 
 run_case 0 0 0
 [ "$CASE_CODE" != 0 ] || fail stale "succeeded although launchd runs another file"
 case "$CASE_OUT" in *"not running the new copy"*) ;; *) fail stale "no message: $CASE_OUT" ;; esac
+
+run_case 0 0 2
+[ "$CASE_CODE" != 0 ] || fail device "succeeded although launchd runs a file on another device with the same inode"
 
 run_case 0 3 0
 [ "$CASE_CODE" = 0 ] || fail off "exit $CASE_CODE: $CASE_OUT"
