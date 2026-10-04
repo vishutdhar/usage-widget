@@ -41,7 +41,8 @@ fail() { echo "FAIL ($1): $2"; status=1; }
 
 # $1 old copy running outside launchd (1/0), $2 the new --register-job result
 # (0 registered, 3 left off, 4 failed), $3 launchd runs the installed file
-# (1), another file (0), or one with the same inode on another device (2).
+# (1), another file (0), or one with the same inode on another device (2),
+# $4 how many times `open` fails before it works (default 0).
 run_case() {
     local TMP
     TMP="$(make_tmp)"
@@ -51,6 +52,7 @@ run_case() {
     echo 1 > "$STATE/registered"
     echo "$2" > "$STATE/register_result"
     echo "$3" > "$STATE/newfile"
+    echo "${4:-0}" > "$STATE/open_failures"
 
     # The new build: a stub that logs its flags and acts on them.
     local new="$TMP/new/Usage Widget.app"
@@ -100,6 +102,12 @@ STUB
     cat > "$BIN/open" <<STUB
 #!/bin/bash
 echo "open" >> "$CALLS"
+left=\$(cat "$STATE/open_failures")
+if [ "\$left" -gt 0 ]; then
+    echo \$((left - 1)) > "$STATE/open_failures"
+    echo "_LSOpenURLsWithCompletionHandler() failed with error -600" >&2
+    exit 1
+fi
 STUB
     cat > "$BIN/lsof" <<STUB
 #!/bin/bash
@@ -118,6 +126,12 @@ printf 'p4242\nftxt\n'
 case "\$fields" in *D*) printf 'D0x%x\n' "\$dev" ;; esac
 case "\$fields" in *i*) printf 'i%s\n' "\$inode" ;; esac
 STUB
+    # Records the wait between open tries (the test's own value), and
+    # sleeps for real for every other wait.
+    cat > "$BIN/sleep" <<STUB
+#!/bin/bash
+if [ "\$1" = 0.001 ]; then echo "sleep" >> "$CALLS"; else /bin/sleep "\$@"; fi
+STUB
     printf '#!/bin/bash\nexit 0\n' > "$BIN/pluginkit"
     printf '#!/bin/bash\nexit 0\n' > "$BIN/lsregister"
     chmod +x "$BIN"/*
@@ -125,7 +139,7 @@ STUB
     CASE_CODE=0
     CASE_OUT="$(STUB_CALLS="$CALLS" PATH="$BIN:$PATH" HOME="$TMP/home" USAGE_WIDGET_BUILT="$new" \
         USAGE_WIDGET_DEST="$DEST" USAGE_WIDGET_LSREGISTER="$BIN/lsregister" USAGE_WIDGET_VERIFY_TRIES=3 \
-        USAGE_WIDGET_STOP_TRIES=5 "$ROOT/Scripts/install.sh" 2>&1)" || CASE_CODE=$?
+        USAGE_WIDGET_STOP_TRIES=5 USAGE_WIDGET_OPEN_WAIT=0.001 "$ROOT/Scripts/install.sh" 2>&1)" || CASE_CODE=$?
     CASE_CALLS="$(tr '\n' '|' < "$CALLS")"
     CASE_OLD_ALIVE=0
     if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then CASE_OLD_ALIVE=1; kill "$OLD_PID"; fi
@@ -158,6 +172,51 @@ run_case 0 4 0
 [ "$CASE_CODE" != 0 ] || fail failed "succeeded although registration failed"
 case "$CASE_OUT" in *"registering the launchd job failed"*) ;; *) fail failed "no message: $CASE_OUT" ;; esac
 [ "$CASE_CALLS" = "launchctl bootout|new --register-job|" ] || fail failed "sequence $CASE_CALLS"
+
+# Opening the status window races the copy launchd just started (-600):
+# a failed open is tried again, and the job's verification decides.
+run_case 0 0 1 1
+[ "$CASE_CODE" = 0 ] || fail open-once "exit $CASE_CODE: $CASE_OUT"
+[ "$CASE_CALLS" = "launchctl bootout|new --register-job|open|sleep|open|" ] || fail open-once "sequence $CASE_CALLS"
+case "$CASE_OUT" in *"could not be opened"*) fail open-once "warned although the second open worked" ;; esac
+
+run_case 0 0 1 99
+[ "$CASE_CODE" = 0 ] || fail open-never "exit $CASE_CODE although launchd runs the new copy: $CASE_OUT"
+case "$CASE_OUT" in *"status window could not be opened"*) ;; *) fail open-never "no note: $CASE_OUT" ;; esac
+case "$CASE_OUT" in *"launchd runs it"*) ;; *) fail open-never "not verified: $CASE_OUT" ;; esac
+[ "$(echo "$CASE_CALLS" | tr '|' '\n' | grep -c '^open$')" = 5 ] || fail open-never "tries: $CASE_CALLS"
+[ "$(echo "$CASE_CALLS" | tr '|' '\n' | grep -c '^sleep$')" = 4 ] || fail open-never "waits between tries: $CASE_CALLS"
+
+# A failed open hides no real failure: launchd running another file still fails.
+opens() { echo "$CASE_CALLS" | tr '|' '\n' | grep -c '^open$'; }
+
+run_case 0 0 0 99
+[ "$CASE_CODE" != 0 ] || fail open-stale "succeeded although launchd runs another file"
+[ "$(opens)" = 5 ] || fail open-stale "tries: $CASE_CALLS"
+case "$CASE_OUT" in *"status window could not be opened"*"not running the new copy; open Usage Widget by hand"*) ;;
+    *) fail open-stale "verification did not decide: $CASE_OUT" ;; esac
+
+# The fifth and last try counts as much as the first.
+run_case 0 0 1 4
+[ "$CASE_CODE" = 0 ] || fail open-fifth "exit $CASE_CODE: $CASE_OUT"
+[ "$(opens)" = 5 ] || fail open-fifth "tries: $CASE_CALLS"
+case "$CASE_OUT" in *"could not be opened"*) fail open-fifth "warned although the fifth open worked" ;; esac
+run_case 0 3 0 4
+[ "$CASE_CODE" = 0 ] || fail open-off-fifth "exit $CASE_CODE: $CASE_OUT"
+case "$CASE_OUT" in *"without launchd"*) ;; *) fail open-off-fifth "no message: $CASE_OUT" ;; esac
+
+# With Start at login off, the opened copy is the only one that runs: an
+# open that never works is a failed install.
+run_case 0 3 0 99
+[ "$CASE_CODE" != 0 ] || fail open-off "succeeded with nothing running"
+case "$CASE_OUT" in *"could not be opened and Start at login is off or awaits approval"*) ;;
+    *) fail open-off "no message: $CASE_OUT" ;; esac
+[ "$(opens)" = 5 ] || fail open-off "tries: $CASE_CALLS"
+
+run_case 0 3 0 1
+[ "$CASE_CODE" = 0 ] || fail open-off-once "exit $CASE_CODE: $CASE_OUT"
+[ "$(opens)" = 2 ] || fail open-off-once "tries: $CASE_CALLS"
+case "$CASE_OUT" in *"without launchd"*) ;; *) fail open-off-once "no message: $CASE_OUT" ;; esac
 
 [ "$status" = 0 ] && echo "install: job booted out, old copy stopped without its flags, replaced, registered by the new copy, verified"
 exit "$status"

@@ -10,6 +10,8 @@ DEST="${USAGE_WIDGET_DEST:-$HOME/Applications/Usage Widget.app}"
 LSREGISTER="${USAGE_WIDGET_LSREGISTER:-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister}"
 VERIFY_TRIES="${USAGE_WIDGET_VERIFY_TRIES:-40}"
 STOP_TRIES="${USAGE_WIDGET_STOP_TRIES:-50}"
+OPEN_TRIES=5
+OPEN_WAIT="${USAGE_WIDGET_OPEN_WAIT:-1}"
 BUNDLE_ID="com.vishutdhar.usagewidget"
 EXE="Contents/MacOS/Usage Widget"
 JOB="gui/$(id -u)/com.vishutdhar.usagewidget.agent"
@@ -75,7 +77,23 @@ case "$REGISTER_STATUS" in
     *) echo "Installed, but registering the launchd job failed (status $REGISTER_STATUS); see above." >&2
        exit 1 ;;
 esac
-open "$DEST"
+# The window is a courtesy; launchd running the new copy (checked below)
+# decides the result. Right after the job registers, LaunchServices can
+# refuse the open (error -600: the copy launchd just started is not known
+# to it yet), so it is tried a few times, then only noted.
+OPENED=false
+for try in $(seq 1 "$OPEN_TRIES"); do
+    if open "$DEST"; then OPENED=true; break; fi
+    if [ "$try" -lt "$OPEN_TRIES" ]; then sleep "$OPEN_WAIT"; fi
+done
+if [ "$OPENED" = false ]; then
+    if [ "$REGISTERED" = false ]; then
+        # With Start at login off, the opened copy is the one that runs.
+        echo "Installed, but Usage Widget could not be opened and Start at login is off or awaits approval, so nothing runs it; open it by hand." >&2
+        exit 1
+    fi
+    echo "The status window could not be opened; checking that launchd runs the new copy anyway." >&2
+fi
 
 # launchd must now run the installed executable: the job's process has
 # that very file (same device and inode) open as its program text.
@@ -102,7 +120,11 @@ for _ in $(seq 1 "$VERIFY_TRIES"); do
     sleep 0.5
 done
 if [ "$REGISTERED" = true ]; then
-    echo "Installed, but launchd is not running the new copy; see its status window." >&2
+    if [ "$OPENED" = true ]; then
+        echo "Installed, but launchd is not running the new copy; see its status window." >&2
+    else
+        echo "Installed, but launchd is not running the new copy; open Usage Widget by hand to see its status window." >&2
+    fi
     exit 1
 fi
 echo "Installed and opened without launchd (Start at login is off or awaits approval): $DEST"
