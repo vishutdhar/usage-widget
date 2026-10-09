@@ -12,8 +12,8 @@ public struct RefreshRequest: Codable, Equatable, Sendable {
     /// deleted or damaged the numbers start again at 1 under a new session.
     public var session: String
     /// The snapshot on disk when the press was made (its writer and write
-    /// number): any snapshot from another writer, or the same writer's
-    /// later number, answers the press.
+    /// number), for diagnosis. A press is answered only by a snapshot that
+    /// names it (`UsageSnapshot.answeredPress`), never merely by a newer one.
     public var afterSnapshot: Int
     public var afterWriter: String
 
@@ -33,6 +33,27 @@ public struct RefreshRequest: Codable, Equatable, Sendable {
         session = try c.decodeIfPresent(String.self, forKey: .session) ?? ""
         afterSnapshot = try c.decodeIfPresent(Int.self, forKey: .afterSnapshot) ?? 0
         afterWriter = try c.decodeIfPresent(String.self, forKey: .afterWriter) ?? ""
+    }
+}
+
+/// A press named by a snapshot as answered: the session and number of the
+/// newest press answered when the snapshot was written. It answers every
+/// press of that session up to that number.
+public struct AnsweredPress: Codable, Equatable, Sendable {
+    public var session: String
+    public var sequence: Int
+
+    public init(session: String, sequence: Int) {
+        self.session = session
+        self.sequence = sequence
+    }
+
+    public init(_ request: RefreshRequest) {
+        self.init(session: request.session, sequence: request.sequence)
+    }
+
+    public func answers(_ request: RefreshRequest) -> Bool {
+        session == request.session && sequence >= request.sequence
     }
 }
 
@@ -77,10 +98,12 @@ public enum RefreshRequestStore {
         return request
     }
 
-    /// Waits, up to `timeout`, for the agent to write a snapshot newer than
-    /// the press. The intent does this before returning, so the reload
-    /// WidgetKit makes after it (not counted against the budget) already
-    /// shows the fresh numbers, even when the agent's own reload is held.
+    /// Waits, up to `timeout`, for the agent to write a snapshot that answers
+    /// the press (names it as answered); a newer snapshot from a background
+    /// poll does not end the wait. The intent does this before returning, so
+    /// the reload WidgetKit makes after it (not counted against the budget)
+    /// already shows the press's numbers, even when the agent's own reload
+    /// is held.
     public enum WaitOutcome: Equatable, Sendable {
         case answered
         case timedOut
@@ -106,7 +129,7 @@ public enum RefreshRequestStore {
         let deadline = clock.now.advanced(by: .milliseconds(Int(timeout * 1000)))
         let url = directory.appendingPathComponent(SharedContainer.snapshotFileName)
         while true {
-            if RefreshState.answers(read(url)?.mark, request) { return .answered }
+            if RefreshState.answers(read(url), request) { return .answered }
             if clock.now >= deadline { return .timedOut }
             do {
                 try await Task.sleep(for: .milliseconds(Int(interval * 1000)))
@@ -136,21 +159,22 @@ public enum RefreshState {
 
     /// A request the agent has not answered yet: made within the last
     /// `window`, and no answering snapshot on hand.
-    public static func pending(_ request: RefreshRequest?, snapshot: SnapshotMark?, at date: Date) -> Bool {
+    public static func pending(_ request: RefreshRequest?, snapshot: UsageSnapshot?, at date: Date) -> Bool {
         guard isUserReload(request, at: date), let request else { return false }
         return !answers(snapshot, request)
     }
 
-    /// A snapshot answers a press when it comes from another writer than
-    /// the one the press saw (a restart, numbering begun again), or from
-    /// the same writer with a later number.
-    public static func answers(_ snapshot: SnapshotMark?, _ request: RefreshRequest) -> Bool {
-        guard let snapshot else { return false }
-        return snapshot.writer != request.afterWriter || snapshot.sequence > request.afterSnapshot
+    /// A snapshot answers a press when it names the press, or a later press
+    /// of its session, as answered. Its writer and write number play no
+    /// part, so a background poll's snapshot written after the press does
+    /// not answer it, and a restart or a wrap of the numbers cannot fake an
+    /// answer.
+    public static func answers(_ snapshot: UsageSnapshot?, _ request: RefreshRequest) -> Bool {
+        snapshot?.answeredPress?.answers(request) ?? false
     }
 
     /// The footer for a press: "Refreshing…" until the agent answers.
-    public static func footer(request: RefreshRequest?, snapshot: SnapshotMark?, at date: Date) -> RefreshFooter {
+    public static func footer(request: RefreshRequest?, snapshot: UsageSnapshot?, at date: Date) -> RefreshFooter {
         pending(request, snapshot: snapshot, at: date) ? .refreshing : .none
     }
 

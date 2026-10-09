@@ -75,6 +75,12 @@ public actor UsageAgent {
     /// The session and number of the last press seen; presses on disk at
     /// launch are old.
     private var lastSeenRefresh: (session: String, sequence: Int)
+    /// The newest press answered, which every snapshot written carries
+    /// (`UsageSnapshot.answeredPress`): a press's poll names the press it
+    /// measured for, any other write carries this forward. At launch, the
+    /// press on disk (old, so counted as answered), else the snapshot's.
+    private var answeredPress: AnsweredPress?
+    private let pressAtLaunch: AnsweredPress?
     /// A press's completion reload: at most one this often.
     public static let pressReloadSpacing: TimeInterval = 10 * 60
     private var lastUserRefresh: SchedulerClock?
@@ -123,6 +129,13 @@ public actor UsageAgent {
         self.launch = clock()
         let onDisk = RefreshRequestStore.read(in: directory)
         self.lastSeenRefresh = (onDisk?.session ?? "", onDisk?.sequence ?? 0)
+        self.pressAtLaunch = onDisk.map(AnsweredPress.init)
+    }
+
+    /// A press numbered past the last one seen in its session (a new
+    /// session counts from 0).
+    private func isUnseen(_ request: RefreshRequest) -> Bool {
+        request.sequence > (request.session == lastSeenRefresh.session ? lastSeenRefresh.sequence : 0)
     }
 
     /// Turns Codex reading on (with a source) or off (nil). Off hides the
@@ -276,11 +289,11 @@ public actor UsageAgent {
     /// numbered past the last one seen (and past any on disk at launch),
     /// and not within `refreshDebounce` of the last one handled, on the
     /// continuous clock. The caller then runs `tick(userRequested: true)`.
+    /// A scheduled poll takes a waiting press itself (`pressToAnswer`).
     public func takeRefreshRequest() -> Bool {
         guard !stopped, let request = RefreshRequestStore.read(in: directory) else { return false }
         // A new session (the file was deleted or damaged) counts from 0.
-        let baseline = request.session == lastSeenRefresh.session ? lastSeenRefresh.sequence : 0
-        guard request.sequence > baseline else { return false }
+        guard isUnseen(request) else { return false }
         // A press is marked seen only once a snapshot answering it is
         // written; until then it stays pending and is looked at again. One
         // already taken and waiting for its poll is left to that poll.
@@ -306,15 +319,17 @@ public actor UsageAgent {
         await tick(userRequested: false)
     }
 
-    /// Writes the last snapshot again under the next write number, which
-    /// answers a press made after it, and logs it. Through the same
+    /// Writes the last snapshot again under the next write number, naming
+    /// the press as answered, and logs it. Through the same
     /// container check as a poll. A press noticed too late for its intent
     /// to see the answer also gets the counted completion reload. False
     /// when nothing could be written.
     private func answerWithTheLastSnapshot(_ request: RefreshRequest, at stamp: SchedulerClock) -> Bool {
         guard containerUsable(), var last = previous else { return false }
         last.writerId = writerId
+        last.answeredPress = AnsweredPress(request)
         guard let outcome = try? SnapshotStore.writeNumbered(last, to: snapshotURL, after: lastWriteSequence) else { return false }
+        answeredPress = last.answeredPress
         lastWriteSequence = outcome.sequence
         last.writeSequence = outcome.sequence
         if let id = outcome.writerId {
@@ -410,6 +425,40 @@ public actor UsageAgent {
         return (press, id, reasons)
     }
 
+    /// Logged when a press falls back to the cached list.
+    public static let noFreshLogLine = "press: cswap has no --fresh; measured with the cached list"
+
+    /// The cswap run of a poll. A press's answer re-measures every account
+    /// (`--fresh`); a background poll takes cswap's cached list. A cswap
+    /// from before `--fresh` refuses the option before doing any work: the
+    /// press is then measured with the cached list, once, and the reload
+    /// log says so. Any other failure is the press's answer, as for a poll.
+    private func runCswap(press: Bool) async -> Result<RunOutput, RunFailure> {
+        let result = await runCswap(fresh: press)
+        guard press, CswapInterpreter.rejectsFresh(result) else { return result }
+        try? CappedLog.append("\(ISODate.format(clock().wall)) \(Self.noFreshLogLine)", to: reloadLogURL,
+                              cap: SharedContainer.logCap)
+        return await runCswap(fresh: false)
+    }
+
+    /// The press a scheduled poll answers in place of measuring the cached
+    /// list: one taken and not yet answered, or a new one on disk, taken
+    /// under the press rules (`takeRefreshRequest`: a press within
+    /// `refreshDebounce` of the last one handled is answered there with the
+    /// last snapshot, and the poll stays a background poll). Nil when none.
+    private func pressToAnswer() -> RefreshRequest? {
+        if takenRequest == nil, !takeRefreshRequest() { return nil }
+        defer { takenRequest = nil }
+        return takenRequest
+    }
+
+    /// One cswap run; a helper left holding its output is counted.
+    private func runCswap(fresh: Bool) async -> Result<RunOutput, RunFailure> {
+        let result = await runner.runList(fresh: fresh)
+        if case .success(let output) = result, output.leftHelper { helperWarnings += 1 }
+        return result
+    }
+
     /// A report for an agent that has stopped: no poll, no write.
     private static func stoppedReport(at now: Date) -> TickReport {
         var report = TickReport(writtenAt: now, status: .error, error: nil, reloadReasons: [])
@@ -418,8 +467,11 @@ public actor UsageAgent {
         return report
     }
 
-    /// One poll. With `userRequested`, the reload that follows skips the
-    /// spacing (it still counts toward the daily cap).
+    /// One poll. With `userRequested` (a press), cswap re-measures every
+    /// account (`runCswap`), and the reload that follows skips the spacing
+    /// (it still counts toward the daily cap). A scheduled poll that finds
+    /// a press waiting, before its run or after it, is that press's answer
+    /// under the same rules.
     public func tick(userRequested: Bool) async -> TickReport {
         // The container is anchored once at launch. Another folder at its
         // path stops the agent for good: no poll, no write into either
@@ -428,8 +480,11 @@ public actor UsageAgent {
         guard containerUsable() else { return Self.stoppedReport(at: clock().wall) }
         // The press this poll answers. It is marked seen once a snapshot
         // answering it is written; if the write fails it is pending again.
-        let taken = userRequested ? takenRequest : nil
-        takenRequest = nil
+        var taken: RefreshRequest?
+        if userRequested {
+            taken = takenRequest
+            takenRequest = nil
+        }
         if !loaded {
             // A restart keeps the last good accounts and the scheduler's memory.
             previous = SnapshotStore.read(from: snapshotURL)
@@ -445,6 +500,7 @@ public actor UsageAgent {
                 }
                 codexCurrent = RememberedReading(seed, at: now, age: age)
             }
+            answeredPress = pressAtLaunch ?? previous?.answeredPress
             if case .string(let text)? = previous?.provider(CodexMerge.provider)?.extras[CodexMerge.appServerCheckedAtKey] {
                 codexAppServerCheckedAt = ISODate.parse(text)
             }
@@ -477,22 +533,37 @@ public actor UsageAgent {
             loaded = true
         }
 
-        let result = await runner.runList()
-        if case .success(let output) = result, output.leftHelper { helperWarnings += 1 }
-        let outcome = CswapInterpreter.interpret(result)
+        // A scheduled poll with a press waiting (made just before it, or
+        // taken and not yet answered) is that press's answer: a fresh run,
+        // under a press's rules.
+        var answering = userRequested
+        if !answering, let pending = pressToAnswer() {
+            taken = pending
+            answering = true
+        }
+        var result = await runCswap(press: answering)
         let polled = clock()
+        let step = await codexStep(now: polled)
+        // A press made while a scheduled poll measured (cswap may take up to
+        // 50 s, Codex up to 20 s) is not answered with its cached numbers:
+        // the widget's intent takes any newer snapshot for its answer, so
+        // they are never written, and the press's fresh run replaces them.
+        if !answering, let pending = pressToAnswer() {
+            taken = pending
+            answering = true
+            result = await runCswap(press: true)
+        }
         var built = SnapshotBuilder.updating(
             previous,
             provider: CswapListMapper.provider,
             source: CswapListMapper.source,
-            outcome: outcome,
+            outcome: CswapInterpreter.interpret(result),
             now: polled.wall
         )
         // Codex off keeps its last block, hidden, so turning it on again (or
         // restarting) starts from those numbers.
         let keptCodex = built.providers.first { $0.provider == CodexMerge.provider }
         built.providers.removeAll { $0.provider == CodexMerge.provider }
-        let step = await codexStep(now: polled)
         // A Codex app-server call may have taken up to its 20 s timeout: the
         // snapshot is dated, Codex aged, and the scheduler decides, after it,
         // all at this one reading. The rollout is kept as of when it was
@@ -539,7 +610,7 @@ public actor UsageAgent {
         // A press's completion reload waits for the snapshot write: until
         // its numbers are on disk nothing about them is saved as requested.
         var pressCandidate: (state: ReloadState, id: Int, reasons: [ReloadReason])?
-        if !userRequested {
+        if !answering {
             // A press's poll never runs the background decision; whether it
             // needs a completion reload is judged once its answer is written.
             let (decision, decided) = ReloadScheduler.decide(state, current: current, clock: stamp,
@@ -550,6 +621,20 @@ public actor UsageAgent {
 
         var written = next
         written.writerId = writerId
+        // The press this snapshot answers: for a press's poll, the newest
+        // press waiting now (one made while it ran is answered too, in the
+        // taken press's session) or else the press taken. Any other
+        // snapshot carries the last answer forward, so a press still
+        // waiting never takes it for its answer.
+        var answer: RefreshRequest?
+        if answering {
+            answer = taken
+            if let onDisk = RefreshRequestStore.read(in: directory), isUnseen(onDisk),
+               taken.map({ $0.session == onDisk.session && $0.sequence <= onDisk.sequence }) ?? true {
+                answer = onDisk
+            }
+        }
+        written.answeredPress = answer.map(AnsweredPress.init) ?? answeredPress
         do {
             let outcome = try SnapshotStore.writeNumbered(written, to: snapshotURL, after: lastWriteSequence)
             lastWriteSequence = outcome.sequence
@@ -572,6 +657,7 @@ public actor UsageAgent {
             return report
         }
         previous = written
+        answeredPress = written.answeredPress
         // Lateness is judged now, with the answer on disk: cswap, Codex and
         // the write all took their time (cswap alone may take up to 50 s).
         // The intent looks for the answer every 0.25 s until its wait ends;
@@ -581,20 +667,20 @@ public actor UsageAgent {
         let tooLate = { (request: RefreshRequest) in
             answered.wall.timeIntervalSince(request.requestedAt) >= RefreshRequestStore.intentWait - RefreshRequestStore.intentPoll
         }
-        if userRequested, taken.map(tooLate) ?? true {
+        if answering, taken.map(tooLate) ?? true {
             pressCandidate = completionCandidate(state, current: current, stamp: answered, conservative: conservative)
         }
-        // A press made while this poll ran (or just before it) is answered
-        // by this snapshot: taking it again would run cswap once more. If
-        // the answer came too late for the intent to see it, and this poll
-        // asks for no reload of its own, the completion reload follows.
-        if let request = RefreshRequestStore.read(in: directory) {
-            let baseline = request.session == lastSeenRefresh.session ? lastSeenRefresh.sequence : 0
-            if request.sequence > baseline, RefreshState.answers(written.mark, request) {
-                lastSeenRefresh = (request.session, request.sequence)
-                if fire == nil, pressCandidate == nil, tooLate(request) {
-                    pressCandidate = completionCandidate(state, current: current, stamp: answered, conservative: conservative)
-                }
+        // The press this snapshot names is answered, and so marked seen
+        // (with any earlier one of its session): taking it again would run
+        // cswap once more. If the answer came too late for the intent to see
+        // it, and this poll asks for no reload of its own, the completion
+        // reload follows. A scheduled poll's cached numbers answer no press:
+        // one made after its last look is taken by the loop and measured
+        // fresh.
+        if let answer, isUnseen(answer) {
+            lastSeenRefresh = (answer.session, answer.sequence)
+            if fire == nil, pressCandidate == nil, tooLate(answer) {
+                pressCandidate = completionCandidate(state, current: current, stamp: answered, conservative: conservative)
             }
         }
         // The completion reload fires only once its time is saved.

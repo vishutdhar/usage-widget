@@ -432,8 +432,8 @@ final class RefreshAgentTests: XCTestCase {
     }
 
     /// A press that arrives while the minute's poll is due is answered by
-    /// that poll: the loop does not run cswap again for it, and no
-    /// completion reload follows.
+    /// that poll, which runs fresh for it: the loop does not run cswap
+    /// again, and no completion reload follows.
     func testAPressDuringADuePollIsAnsweredByThatPoll() async throws {
         let dir = try makeTemporaryDirectory()
         let clock = ManualClock(start)
@@ -448,6 +448,7 @@ final class RefreshAgentTests: XCTestCase {
         let taken = await agent.takeRefreshRequest()
         XCTAssertFalse(taken, "answered by the poll that just wrote")
         XCTAssertEqual(runner.calls - before, 1, "one cswap run for the press")
+        XCTAssertEqual(runner.freshFlags.last, true, "and it measured every account now")
         XCTAssertEqual(reloads.count, 1, "the first poll's only; no completion reload")
         clock.advance(40)
         try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
@@ -563,20 +564,24 @@ final class RefreshAgentTests: XCTestCase {
         }
     }
 
-    /// A scheduled poll that asks for a background reload of its own needs
-    /// no completion reload on top, however late it answers the press.
-    func testALatePressAnsweredByAReloadingPollGetsOneReload() async throws {
+    /// A scheduled poll that answers a late press, with a change it would
+    /// otherwise reload for, is the press's answer: no background decision,
+    /// and the one reload is the press's completion reload, not a
+    /// background reload with a completion reload on top.
+    func testALatePressAnsweredByAScheduledPollGetsOneReload() async throws {
         let dir = try makeTemporaryDirectory()
         let clock = ManualClock(start)
         let reloads = Counter()
-        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok(20), ok(30)]), reload: { reloads.increment() },
-                               clock: { clock.stamp })
+        let runner = ScriptedRunner([ok(20), ok(30)])
+        let agent = UsageAgent(directory: dir, runner: runner, reload: { reloads.increment() }, clock: { clock.stamp })
         _ = await agent.tick()
         clock.advance(11 * 60)
         try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         let report = await agent.tick()
-        XCTAssertEqual(reloads.count, 2, "the poll's own reload, and no second one")
-        XCTAssertFalse(report.reloadReasons.contains(.user))
+        XCTAssertEqual(runner.freshFlags, [false, true], "measured fresh for the press")
+        XCTAssertEqual(reloads.count, 2, "one reload for the poll, and no second one")
+        XCTAssertTrue(report.reloadReasons.contains(.user), "the press's completion reload")
+        XCTAssertTrue(try XCTUnwrap(try log(dir).split(separator: "\n").last).contains("kind=press"))
         XCTAssertEqual(state(dir)?.requests.count, 2)
     }
 
@@ -743,23 +748,30 @@ final class RefreshAgentTests: XCTestCase {
         XCTAssertTrue(taken, "the next press is taken")
     }
 
-    /// A press the poll's snapshot does not answer (made after that write)
-    /// is left for the loop to take.
+    /// A press made after a press's answer was written is not named by it,
+    /// so it is left for the loop to take. (A scheduled poll's cached
+    /// snapshot names no new press at all.) The later press is made on the
+    /// press poll's third clock reading, just after its write; the test
+    /// checks it landed after the write.
     func testAPressNotAnsweredByThePollIsLeftToTake() async throws {
         let dir = try makeTemporaryDirectory()
         let clock = ManualClock(start)
-        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp })
+        let hook = ClockHook()
+        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {},
+                               clock: { hook.read(); return clock.stamp })
         _ = await agent.tick()
-        let written = try XCTUnwrap(SnapshotStore.read(from: dir.appendingPathComponent("snapshot.json")))
-        let writer = await agent.currentWriterId
-        // Made after the next write: it names that write's number as seen.
-        let request = RefreshRequest(requestedAt: clock.now, sequence: 1, session: "s",
-                                     afterSnapshot: (written.writeSequence ?? 0) + 1, afterWriter: writer)
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .secondsSince1970
-        try encoder.encode(request).write(to: dir.appendingPathComponent(RefreshRequestStore.fileName))
         clock.advance(60)
-        _ = await agent.tick()
+        try RefreshRequestStore.request(in: dir, at: clock.now)
+        let took = await agent.takeRefreshRequest()
+        XCTAssertTrue(took)
+        let made = RequestBox()
+        hook.arm(onRead: 3) { made.set(try? RefreshRequestStore.request(in: dir, at: clock.now)) }
+        _ = await agent.tick(userRequested: true)
+        let later = try XCTUnwrap(made.value)
+        let snapshot = SnapshotStore.read(from: dir.appendingPathComponent("snapshot.json"))
+        XCTAssertEqual(later.afterSnapshot, snapshot?.writeSequence, "made just after the answer's write")
+        XCTAssertFalse(RefreshState.answers(snapshot, later))
+        clock.advance(31)
         let taken = await agent.takeRefreshRequest()
         XCTAssertTrue(taken, "not answered by that poll, so still a press to take")
     }
@@ -1119,7 +1131,7 @@ final class WriterAgentTests: XCTestCase {
 final class AlternatingRunner: CswapRunning, @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
-    func runList() async -> Result<RunOutput, RunFailure> {
+    func runList(fresh: Bool) async -> Result<RunOutput, RunFailure> {
         let pct = lock.withLock { () -> Double in
             count += 1
             return count % 2 == 0 ? 30 : 20
@@ -1151,7 +1163,7 @@ final class SlowRunner: CswapRunning, @unchecked Sendable {
         self.seconds = seconds
     }
 
-    func runList() async -> Result<RunOutput, RunFailure> {
+    func runList(fresh: Bool) async -> Result<RunOutput, RunFailure> {
         if slow.on { clock.advance(seconds) }
         return .success(RunOutput(exitCode: 0, stdout: listJSON([("1", true, 20)])))
     }

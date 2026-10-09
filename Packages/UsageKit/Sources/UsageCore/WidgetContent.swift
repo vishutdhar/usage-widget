@@ -229,7 +229,7 @@ public struct WidgetContent: Equatable, Sendable {
 
     public static func make(snapshot: UsageSnapshot?, at date: Date, refresh: RefreshRequest?) -> WidgetContent {
         var content = make(snapshot: snapshot, at: date)
-        content.refreshFooter = RefreshState.footer(request: refresh, snapshot: snapshot?.mark, at: date)
+        content.refreshFooter = RefreshState.footer(request: refresh, snapshot: snapshot, at: date)
         return content
     }
 

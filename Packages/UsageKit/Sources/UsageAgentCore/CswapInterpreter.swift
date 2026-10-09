@@ -34,6 +34,25 @@ public enum CswapInterpreter {
         }
     }
 
+    /// argparse's line for options it does not know: "<prog>: error:
+    /// unrecognized arguments: <the arguments, space separated>".
+    static let unrecognizedArguments = "error: unrecognized arguments:"
+
+    /// True when a `--fresh` run failed only because this cswap does not
+    /// know the option (a build from before it): argparse's own refusal,
+    /// exit status 2 and a stderr line "error: unrecognized arguments:"
+    /// whose arguments include `--fresh`. cswap parses its arguments before
+    /// doing anything, so such a run measured nothing. Any other exit,
+    /// text or stream (an argument conflict, a failure that names --fresh)
+    /// is the ordinary error path.
+    public static func rejectsFresh(_ result: Result<RunOutput, RunFailure>) -> Bool {
+        guard case .success(let output) = result, output.exitCode == 2 else { return false }
+        return String(decoding: output.stderr, as: UTF8.self).split(whereSeparator: \.isNewline).contains { line in
+            guard let marker = line.range(of: unrecognizedArguments) else { return false }
+            return line[marker.upperBound...].split(separator: " ").contains("--fresh")
+        }
+    }
+
     static func reason(for failure: RunFailure) -> String {
         switch failure {
         case .notFound:

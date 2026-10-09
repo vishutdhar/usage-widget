@@ -143,11 +143,30 @@ codex app-server, at most 8 a day
 - **Refresh button**: a circular arrow at the right of both sizes' footer.
   Its intent only writes `refresh-request.json` into the group container
   (the extension never runs a process), and WidgetKit reloads the widget as
-  the intent returns. The agent looks for a request every 2 seconds and
-  answers with an immediate `cswap list --json` and a new snapshot. The
-  reload WidgetKit makes after the intent is the press's own and is not
-  budgeted. Only when the answer is written too late for the intent to see
-  it (24.75 seconds or more after the press, judged once the answer is
+  the intent returns. The agent answers with an immediate
+  `cswap list --json --fresh` and a new snapshot. `--fresh` makes cswap
+  re-measure every account now (it serves as they are only the accounts it
+  is holding back: quarantined, backing off after a 429, or claimed),
+  where a background poll's `cswap list --json` serves an account's cached
+  numbers while they are younger than cswap's serve time (3 to 10
+  minutes). The "as of" line keeps its rule (the oldest measurement on
+  screen), so after a press it shows the time of the press. A press made
+  just before or during a scheduled poll makes that poll its answer, under
+  a press's rules: the poll runs `--fresh`, and cached numbers it already
+  measured are not written. A press is answered only by a snapshot that
+  names it (`answeredPress`, below): the intent waits for one, and the
+  footer says "Refreshing…" until one lands, so a background poll's
+  snapshot written meanwhile, newer but naming no new press, ends neither.
+  A cswap from before `--fresh` refuses the option before doing any work
+  (argparse's exit status 2 and "error: unrecognized arguments: --fresh"
+  on stderr): the agent then measures the press once
+  more with the cached `cswap list --json` and writes one line, "press:
+  cswap has no --fresh; measured with the cached list", to
+  `reload-log.txt`. Any other failure is shown as it is for a background
+  poll. The reload WidgetKit makes after the intent is the
+  press's own and is not budgeted. Only when the answer is written too
+  late for the intent to see it (24.75 seconds or more after the press,
+  judged once the answer is
   written) does the agent add one completion reload, at most one every 10
   minutes, which takes a token (borrowing one from an empty bucket, one
   debt at most) and counts like any background reload, so presses cannot
@@ -211,6 +230,7 @@ Shared code lives in the `Packages/UsageKit` package:
   "schemaVersion": 1,
   "writtenAt": "2026-01-15T10:01:00.000Z",
   "writeSequence": 1000,
+  "answeredPress": {"session": "6F1C0A52-…", "sequence": 12},
   "providers": [{
     "provider": "claude", "source": "cswap-list", "status": "ok", "error": null,
     "accounts": [{
@@ -251,9 +271,16 @@ Shared code lives in the `Packages/UsageKit` package:
   is for display), decide order: the agent keeps its last number in
   `writer-state.json`, adopts a higher number found on disk (logged once)
   rather than stopping, and treats a number outside 0 to Int.max/2 as a
-  corrupt snapshot. A refresh press is answered by a snapshot from another
-  writer or with a later number from the same one, so a clock correction, a
-  deleted snapshot or a restart cannot hold writes back or strand a press.
+  corrupt snapshot. Neither decides whether a refresh press is answered.
+- `answeredPress` names the newest refresh press answered (its session and
+  number): a press's poll names the press it measured for (and a press
+  made while it ran), and every other write carries the last one forward.
+  A press is answered by a snapshot naming it or a later press of its
+  session, never merely by a newer snapshot, so a clock correction, a
+  deleted snapshot, a restart or a wrap of the numbers cannot fake an
+  answer. A press on disk when the agent starts counts as old, and the
+  restarted agent's first snapshot names it, so a restart does not strand
+  it either. Absent before the first press.
 - Every file in the group container (the snapshot, refresh request,
   reload and writer state, Codex call log, both logs and the lock)
   and every Codex rollout is read and written through one helper. The
@@ -368,9 +395,11 @@ refreshes. Nothing in the app measures or adapts to this; the cap is fixed.
 - **Refresh budget.** WidgetKit decides when a widget actually reloads. The
   agent asks at most 40 times a day and the widget's own timeline at most
   8, so a change can take 10 minutes to appear, longer once the 40 are
-  spent or if macOS is stricter; the refresh button shows fresh numbers at
-  once. The "as of" line always says when
-  the numbers on screen were measured.
+  spent or if macOS is stricter. The refresh button re-measures every
+  account (`cswap list --json --fresh`; with a cswap from before that
+  option, the cached list) and shows the numbers at once, through the
+  intent's own reload, which is not budgeted. The "as of" line always says
+  when the numbers on screen were measured.
 
 ## Tests
 
