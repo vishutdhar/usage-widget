@@ -28,18 +28,57 @@ final class RefreshRequestTests: XCTestCase {
         XCTAssertNil(RefreshRequestStore.read(in: dir))
     }
 
-    /// Pending until the agent writes the snapshot after the one the press
-    /// saw (by write number, not by clock), or 90 s pass.
-    func testARequestIsPendingUntilTheAgentAnswersOrNinetySecondsPass() {
-        let request = RefreshRequest(requestedAt: t0, afterSnapshot: 5)
-        XCTAssertTrue(RefreshState.pending(request, snapshot: SnapshotMark(writer: "", sequence: 5), at: t0.addingTimeInterval(10)))
-        XCTAssertTrue(RefreshState.pending(request, snapshot: SnapshotMark(writer: "", sequence: 5), at: t0.addingTimeInterval(89)))
-        XCTAssertFalse(RefreshState.pending(request, snapshot: SnapshotMark(writer: "", sequence: 5), at: t0.addingTimeInterval(90)),
+    /// Pending until a snapshot names the press (or a later press of its
+    /// session) as answered, or 90 s pass. A newer snapshot that names only
+    /// an earlier press, from this writer or another, does not end it.
+    func testARequestIsPendingUntilASnapshotAnswersItOrNinetySecondsPass() {
+        let request = RefreshRequest(requestedAt: t0, sequence: 4, session: "s", afterSnapshot: 5, afterWriter: "w")
+        let earlier = UsageSnapshot(writtenAt: t0, providers: [], writeSequence: 5, writerId: "w",
+                                    answeredPress: AnsweredPress(session: "s", sequence: 3))
+        XCTAssertTrue(RefreshState.pending(request, snapshot: earlier, at: t0.addingTimeInterval(10)))
+        XCTAssertTrue(RefreshState.pending(request, snapshot: earlier, at: t0.addingTimeInterval(89)))
+        XCTAssertFalse(RefreshState.pending(request, snapshot: earlier, at: t0.addingTimeInterval(90)),
                        "after 90 s the footer goes back to as of")
-        XCTAssertFalse(RefreshState.pending(request, snapshot: SnapshotMark(writer: "", sequence: 6), at: t0.addingTimeInterval(10)),
-                       "the agent wrote the next snapshot")
-        XCTAssertFalse(RefreshState.pending(nil, snapshot: SnapshotMark(writer: "", sequence: 5), at: t0))
+        var newer = earlier
+        newer.writeSequence = 6
+        XCTAssertTrue(RefreshState.pending(request, snapshot: newer, at: t0.addingTimeInterval(10)),
+                      "a newer snapshot that answers an earlier press")
+        var restarted = earlier
+        restarted.writerId = "x"
+        restarted.writeSequence = 1
+        XCTAssertTrue(RefreshState.pending(request, snapshot: restarted, at: t0.addingTimeInterval(10)), "another writer's")
+        var answer = newer
+        answer.answeredPress = AnsweredPress(request)
+        XCTAssertFalse(RefreshState.pending(request, snapshot: answer, at: t0.addingTimeInterval(10)), "named as answered")
+        var later = newer
+        later.answeredPress = AnsweredPress(session: "s", sequence: 5)
+        XCTAssertFalse(RefreshState.pending(request, snapshot: later, at: t0.addingTimeInterval(10)),
+                       "a later press's answer answers this one too")
+        var otherSession = newer
+        otherSession.answeredPress = AnsweredPress(session: "t", sequence: 9)
+        XCTAssertTrue(RefreshState.pending(request, snapshot: otherSession, at: t0.addingTimeInterval(10)), "another session's")
+        XCTAssertFalse(RefreshState.pending(nil, snapshot: earlier, at: t0))
         XCTAssertTrue(RefreshState.pending(request, snapshot: nil, at: t0.addingTimeInterval(1)))
+    }
+
+    /// A background poll's snapshot written while a press waits is newer
+    /// than the press but answers no press of it: the widget keeps saying
+    /// "Refreshing…" and plans the end of it, until the answer lands.
+    func testABackgroundSnapshotDuringAPendingPressStillSaysRefreshing() {
+        let request = RefreshRequest(requestedAt: t0, sequence: 4, session: "s", afterSnapshot: 5, afterWriter: "w")
+        let background = UsageSnapshot(writtenAt: t0.addingTimeInterval(3), providers: [], writeSequence: 6, writerId: "w",
+                                       answeredPress: AnsweredPress(session: "s", sequence: 3))
+        let entries = WidgetContent.timelineEntries(for: background, readAt: t0.addingTimeInterval(4), refresh: request)
+        XCTAssertEqual(entries.first?.content.refreshFooter, .refreshing)
+        XCTAssertTrue(TimelinePlan.plan(for: background, now: t0.addingTimeInterval(4), refresh: request).entries
+            .contains(t0.addingTimeInterval(RefreshState.window)), "the end of Refreshing is planned")
+        var answer = background
+        answer.writeSequence = 7
+        answer.answeredPress = AnsweredPress(request)
+        let answered = WidgetContent.timelineEntries(for: answer, readAt: t0.addingTimeInterval(5), refresh: request)
+        XCTAssertEqual(answered.first?.content.refreshFooter, RefreshFooter.none)
+        XCTAssertFalse(TimelinePlan.plan(for: answer, now: t0.addingTimeInterval(5), refresh: request).entries
+            .contains(t0.addingTimeInterval(RefreshState.window)))
     }
 
     func testTheWidgetSaysRefreshingAndPlansTheEndOfIt() {
@@ -128,7 +167,8 @@ final class RefreshPressTests: XCTestCase {
         Task.detached {
             try? await Task.sleep(for: .milliseconds(300))
             try? SnapshotStore.write(UsageSnapshot(writtenAt: request.requestedAt.addingTimeInterval(-600), providers: [],
-                                                   writeSequence: request.afterSnapshot + 1),
+                                                   writeSequence: request.afterSnapshot + 1,
+                                                   answeredPress: AnsweredPress(request)),
                                      to: snapshotURL)
         }
         let started = Date()
@@ -138,7 +178,29 @@ final class RefreshPressTests: XCTestCase {
 
         let later = try RefreshRequestStore.request(in: dir, at: Date())
         let quiet = await RefreshRequestStore.waitForAnswer(in: dir, to: later, timeout: 0.4)
-        XCTAssertEqual(quiet, .timedOut, "no newer snapshot: gives up at the timeout")
+        XCTAssertEqual(quiet, .timedOut, "no snapshot answers it: gives up at the timeout")
+    }
+
+    /// A background poll writes after the press: its snapshot is newer but
+    /// answers no press of it, so the wait goes on until the snapshot that
+    /// names the press lands (written here on the third look).
+    func testTheIntentWaitsPastABackgroundSnapshotForItsAnswer() async throws {
+        let dir = try tempDir()
+        let request = try RefreshRequestStore.request(in: dir, at: Date())
+        let url = dir.appendingPathComponent(SharedContainer.snapshotFileName)
+        try SnapshotStore.write(UsageSnapshot(writtenAt: Date(), providers: [], writeSequence: request.afterSnapshot + 1,
+                                              writerId: request.afterWriter), to: url)
+        let reads = ReadCounter()
+        let outcome = await RefreshRequestStore.waitForAnswer(in: dir, to: request, timeout: 5, interval: 0.01, read: { url in
+            reads.add()
+            if reads.count == 3 {
+                try? SnapshotStore.write(UsageSnapshot(writtenAt: Date(), providers: [], writeSequence: request.afterSnapshot + 2,
+                                                       answeredPress: AnsweredPress(request)), to: url)
+            }
+            return SnapshotStore.read(from: url)
+        })
+        XCTAssertEqual(outcome, .answered)
+        XCTAssertEqual(reads.count, 3, "the newer background snapshot did not end the wait; the answer did")
     }
 
     /// Cancelled, the wait returns at once and reads nothing more.
@@ -216,12 +278,12 @@ final class RefreshPressTests: XCTestCase {
     /// "as of" footer; nothing else, whatever the cap.
     func testTheFooterStates() {
         let request = RefreshRequest(requestedAt: t0, sequence: 4, session: "s2", afterSnapshot: 5)
-        XCTAssertEqual(RefreshState.footer(request: request, snapshot: SnapshotMark(writer: "", sequence: 5),
-                                           at: t0.addingTimeInterval(3)), .refreshing)
-        XCTAssertEqual(RefreshState.footer(request: request, snapshot: SnapshotMark(writer: "", sequence: 6),
-                                           at: t0.addingTimeInterval(3)), .none, "answered")
-        XCTAssertEqual(RefreshState.footer(request: request, snapshot: SnapshotMark(writer: "", sequence: 5),
-                                           at: t0.addingTimeInterval(91)), .none, "after the window")
+        let waiting = UsageSnapshot(writtenAt: t0, providers: [], writeSequence: 5)
+        let answer = UsageSnapshot(writtenAt: t0, providers: [], writeSequence: 6, answeredPress: AnsweredPress(request))
+        XCTAssertEqual(RefreshState.footer(request: request, snapshot: waiting, at: t0.addingTimeInterval(3)), .refreshing)
+        XCTAssertEqual(RefreshState.footer(request: request, snapshot: answer, at: t0.addingTimeInterval(3)), .none, "answered")
+        XCTAssertEqual(RefreshState.footer(request: request, snapshot: waiting, at: t0.addingTimeInterval(91)), .none,
+                       "after the window")
     }
 
     /// A press answered at the cap: the widget shows the new snapshot's
@@ -236,6 +298,7 @@ final class RefreshPressTests: XCTestCase {
             ]),
         ])
         snapshot.writeSequence = 6
+        snapshot.answeredPress = AnsweredPress(request)
         let content = WidgetContent.make(snapshot: snapshot, at: t0.addingTimeInterval(2), refresh: request)
         XCTAssertEqual(content.refreshFooter, .none)
         XCTAssertEqual(content.sections[0].accounts[0].rows[0].percentText, "77%")
@@ -267,6 +330,7 @@ final class RefreshPressTests: XCTestCase {
                                                 outcome: .success(accounts), now: utc(2026, 10, 9, 16, 8, 54))
         snapshot.writeSequence = 6
         snapshot.writerId = "w"
+        snapshot.answeredPress = AnsweredPress(request)
         let entries = WidgetContent.timelineEntries(for: snapshot, readAt: utc(2026, 10, 9, 16, 8, 55), refresh: request)
         let entry = try XCTUnwrap(entries.first)
         XCTAssertEqual(entry.content.refreshFooter, .none, "the press is answered")

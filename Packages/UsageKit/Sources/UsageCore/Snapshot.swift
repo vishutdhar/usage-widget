@@ -19,19 +19,27 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
     /// A random id the agent draws at each launch: a snapshot from another
     /// launch answers a pending press even when numbering started again.
     public var writerId: String?
+    /// The newest refresh press answered when this was written, by this
+    /// snapshot or an earlier one: a press's poll names the press it
+    /// measured for, and every other write carries the last answer forward.
+    /// A press is answered by a snapshot that names it or a later press of
+    /// its session, never merely by a newer one. Nil before any press.
+    public var answeredPress: AnsweredPress?
 
     public init(
         schemaVersion: Int = UsageSnapshot.currentSchemaVersion,
         writtenAt: Date,
         providers: [ProviderUsage],
         writeSequence: Int? = nil,
-        writerId: String? = nil
+        writerId: String? = nil,
+        answeredPress: AnsweredPress? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.writtenAt = writtenAt
         self.providers = providers
         self.writeSequence = writeSequence
         self.writerId = writerId
+        self.answeredPress = answeredPress
     }
 
     /// Which write this is: the writer and its number.

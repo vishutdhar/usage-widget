@@ -748,28 +748,29 @@ final class RefreshAgentTests: XCTestCase {
         XCTAssertTrue(taken, "the next press is taken")
     }
 
-    /// A press a press's snapshot does not answer (made after that write)
-    /// is left for the loop to take. (A scheduled poll's cached snapshot
-    /// answers no press at all.)
+    /// A press made after a press's answer was written is not named by it,
+    /// so it is left for the loop to take. (A scheduled poll's cached
+    /// snapshot names no new press at all.) The later press is made on the
+    /// press poll's third clock reading, just after its write; the test
+    /// checks it landed after the write.
     func testAPressNotAnsweredByThePollIsLeftToTake() async throws {
         let dir = try makeTemporaryDirectory()
         let clock = ManualClock(start)
-        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp })
+        let hook = ClockHook()
+        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {},
+                               clock: { hook.read(); return clock.stamp })
         _ = await agent.tick()
-        let written = try XCTUnwrap(SnapshotStore.read(from: dir.appendingPathComponent("snapshot.json")))
-        let writer = await agent.currentWriterId
         clock.advance(60)
-        let first = try RefreshRequestStore.request(in: dir, at: clock.now)
+        try RefreshRequestStore.request(in: dir, at: clock.now)
         let took = await agent.takeRefreshRequest()
         XCTAssertTrue(took)
-        // The next press, made after the answer's write: it names that
-        // write's number as seen.
-        let request = RefreshRequest(requestedAt: clock.now, sequence: first.sequence + 1, session: first.session,
-                                     afterSnapshot: (written.writeSequence ?? 0) + 1, afterWriter: writer)
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .secondsSince1970
-        try encoder.encode(request).write(to: dir.appendingPathComponent(RefreshRequestStore.fileName))
+        let made = RequestBox()
+        hook.arm(onRead: 3) { made.set(try? RefreshRequestStore.request(in: dir, at: clock.now)) }
         _ = await agent.tick(userRequested: true)
+        let later = try XCTUnwrap(made.value)
+        let snapshot = SnapshotStore.read(from: dir.appendingPathComponent("snapshot.json"))
+        XCTAssertEqual(later.afterSnapshot, snapshot?.writeSequence, "made just after the answer's write")
+        XCTAssertFalse(RefreshState.answers(snapshot, later))
         clock.advance(31)
         let taken = await agent.takeRefreshRequest()
         XCTAssertTrue(taken, "not answered by that poll, so still a press to take")

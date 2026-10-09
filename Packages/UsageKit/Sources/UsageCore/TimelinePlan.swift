@@ -24,7 +24,7 @@ public enum TimelinePlan {
     /// runs out, so the footer goes back to "as of" on time.
     public static func plan(for snapshot: UsageSnapshot?, now: Date, refresh: RefreshRequest?) -> Plan {
         var plan = plan(for: snapshot, now: now)
-        if RefreshState.footer(request: refresh, snapshot: snapshot?.mark, at: now) != .none,
+        if RefreshState.footer(request: refresh, snapshot: snapshot, at: now) != .none,
            let refresh {
             let end = refresh.requestedAt.addingTimeInterval(RefreshState.window)
             plan.entries = Array(Set(plan.entries + [end])).sorted()

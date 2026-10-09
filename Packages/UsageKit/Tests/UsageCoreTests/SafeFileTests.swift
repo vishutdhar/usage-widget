@@ -383,15 +383,17 @@ final class WriteNumberTests: XCTestCase {
         let url = dir.appendingPathComponent("snapshot.json")
         let last = WriterState.maxSequence - 1
         try SnapshotStore.write(UsageSnapshot(writtenAt: t0, providers: [], writeSequence: last, writerId: "OLD"), to: url)
-        let request = RefreshRequest(requestedAt: t0, afterSnapshot: last, afterWriter: "OLD")
-        let outcome = try SnapshotStore.writeNumbered(UsageSnapshot(writtenAt: t0, providers: [], writerId: "OLD"), to: url,
-                                                      after: last)
+        let request = RefreshRequest(requestedAt: t0, sequence: 2, session: "s", afterSnapshot: last, afterWriter: "OLD")
+        let outcome = try SnapshotStore.writeNumbered(UsageSnapshot(writtenAt: t0, providers: [], writerId: "OLD",
+                                                                    answeredPress: AnsweredPress(request)),
+                                                      to: url, after: last)
         XCTAssertEqual(outcome.sequence, 1)
         XCTAssertNotEqual(outcome.writerId, "OLD")
         let written = try XCTUnwrap(SnapshotStore.read(from: url))
         XCTAssertEqual(written.writeSequence, 1)
         XCTAssertEqual(written.writerId, outcome.writerId)
-        XCTAssertTrue(RefreshState.answers(written.mark, request))
+        XCTAssertEqual(written.answeredPress, AnsweredPress(request), "the wrap keeps the answered press")
+        XCTAssertTrue(RefreshState.answers(written, request))
     }
 
     func testAHigherNumberFromAnotherWriterIsAdopted() throws {
@@ -407,13 +409,24 @@ final class WriteNumberTests: XCTestCase {
         XCTAssertNil(own.adopted)
     }
 
-    /// A press is answered by a snapshot from another writer (a restart),
-    /// or by the same writer's next number.
-    func testAnswersFollowTheWriterAndItsNumber() {
-        let request = RefreshRequest(requestedAt: t0, afterSnapshot: 9, afterWriter: "A")
-        XCTAssertTrue(RefreshState.answers(SnapshotMark(writer: "B", sequence: 1), request))
-        XCTAssertTrue(RefreshState.answers(SnapshotMark(writer: "A", sequence: 10), request))
-        XCTAssertFalse(RefreshState.answers(SnapshotMark(writer: "A", sequence: 9), request))
+    /// A press is answered by a snapshot that names it, or a later press of
+    /// its session, as answered. The writer and the write number play no
+    /// part: a newer snapshot, or another writer's, answers nothing by
+    /// being newer.
+    func testAPressIsAnsweredByNameNotByWriterOrNumber() {
+        let request = RefreshRequest(requestedAt: t0, sequence: 4, session: "s", afterSnapshot: 9, afterWriter: "A")
+        func snapshot(_ writer: String, _ number: Int, _ answered: AnsweredPress?) -> UsageSnapshot {
+            UsageSnapshot(writtenAt: t0, providers: [], writeSequence: number, writerId: writer, answeredPress: answered)
+        }
+        XCTAssertFalse(RefreshState.answers(snapshot("B", 1, nil), request), "another writer")
+        XCTAssertFalse(RefreshState.answers(snapshot("A", 10, AnsweredPress(session: "s", sequence: 3)), request),
+                       "a later number naming an earlier press")
+        XCTAssertTrue(RefreshState.answers(snapshot("A", 9, AnsweredPress(session: "s", sequence: 4)), request),
+                      "named, whatever its number")
+        XCTAssertTrue(RefreshState.answers(snapshot("B", 1, AnsweredPress(session: "s", sequence: 5)), request),
+                      "a later press of the session")
+        XCTAssertFalse(RefreshState.answers(snapshot("A", 10, AnsweredPress(session: "t", sequence: 4)), request),
+                       "another session")
         XCTAssertFalse(RefreshState.answers(nil, request), "no snapshot yet")
     }
 }

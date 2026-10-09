@@ -29,14 +29,15 @@ func makeCswapHome(_ body: String) throws -> URL {
     return home
 }
 
-/// cswap list --json output with one account per (id, active, fiveHourPct).
-func listJSON(_ accounts: [(String, Bool, Double)], schema: Int = 1) -> Data {
+/// cswap list --json output with one account per (id, active, fiveHourPct),
+/// each measured at `fetchedAt`.
+func listJSON(_ accounts: [(String, Bool, Double)], schema: Int = 1, fetchedAt: String = "2026-09-27T10:00:00Z") -> Data {
     let rows = accounts.map { id, active, pct in
         """
         {"number": \(id), "email": "user\(id)@example.com", "active": \(active), "usageStatus": "ok",
          "usage": {"fiveHour": {"pct": \(pct), "resetsAt": "2026-09-27T14:00:00+00:00"},
                    "sevenDay": {"pct": 50.0, "resetsAt": "2026-10-01T00:00:00+00:00", "expectedPct": 40.0, "aheadOfPace": false}},
-         "usageFetchedAt": "2026-09-27T10:00:00Z"}
+         "usageFetchedAt": "\(fetchedAt)"}
         """
     }
     return Data("{\"schemaVersion\": \(schema), \"accounts\": [\(rows.joined(separator: ","))]}".utf8)
