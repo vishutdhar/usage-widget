@@ -363,6 +363,43 @@ final class PressFreshTests: XCTestCase {
             .contains(request.requestedAt.addingTimeInterval(RefreshState.window)))
     }
 
+    /// A press inside the debounce is answered with the last snapshot, which
+    /// names it; the next background poll carries that answer forward, so a
+    /// timeline built from it while the press's 90 s still run says "as of"
+    /// for that press too, not "Refreshing…" again.
+    func testABackgroundPollAfterADebouncedAnswerKeepsNamingThatPress() async throws {
+        let dir = try makeTemporaryDirectory()
+        let clock = ManualClock(start)
+        let runner = ScriptedRunner([ok()])
+        let agent = UsageAgent(directory: dir, runner: runner, reload: {}, clock: { clock.stamp })
+        _ = await agent.tick()
+        clock.advance(60)
+        let first = try RefreshRequestStore.request(in: dir, at: clock.now)
+        let took = await agent.takeRefreshRequest()
+        XCTAssertTrue(took)
+        _ = await agent.tick(userRequested: true)
+        clock.advance(0.3)
+        let second = try RefreshRequestStore.request(in: dir, at: clock.now)
+        let again = await agent.takeRefreshRequest()
+        XCTAssertFalse(again, "inside the debounce: answered with the last snapshot")
+        let url = dir.appendingPathComponent(SharedContainer.snapshotFileName)
+        let debounced = try XCTUnwrap(SnapshotStore.read(from: url))
+        XCTAssertEqual(debounced.answeredPress, AnsweredPress(second))
+        XCTAssertNotEqual(AnsweredPress(second), AnsweredPress(first))
+
+        clock.advance(60)
+        _ = await agent.tick()
+        XCTAssertEqual(runner.freshFlags, [false, true, false], "then a background poll")
+        let background = try XCTUnwrap(SnapshotStore.read(from: url))
+        XCTAssertGreaterThan(background.writeSequence ?? 0, debounced.writeSequence ?? 0, "a new snapshot")
+        XCTAssertEqual(background.answeredPress, AnsweredPress(second), "it still names the debounced press")
+        XCTAssertLessThan(clock.now.timeIntervalSince(second.requestedAt), RefreshState.window, "inside the press's 90 s")
+        let entries = WidgetContent.timelineEntries(for: background, readAt: clock.now, refresh: second)
+        XCTAssertEqual(entries.first?.content.refreshFooter, RefreshFooter.none, "not Refreshing again")
+        XCTAssertFalse(TimelinePlan.plan(for: background, now: clock.now, refresh: second).entries
+            .contains(second.requestedAt.addingTimeInterval(RefreshState.window)))
+    }
+
     /// A press taken and not yet answered when a scheduled poll runs is
     /// answered by that poll, fresh.
     func testAPressTakenButNotYetAnsweredIsAnsweredFreshByTheNextPoll() async throws {
