@@ -150,12 +150,17 @@ codex app-server, at most 8 a day
   where a background poll's `cswap list --json` serves an account's cached
   numbers while they are younger than cswap's serve time (3 to 10
   minutes). The "as of" line keeps its rule (the oldest measurement on
-  screen), so after a press it shows the time of the press. A cswap from
-  before `--fresh` refuses the option before doing any work: the agent then
-  measures the press once more with the cached `cswap list --json` and
-  writes one line, "press: cswap has no --fresh; measured with the cached
-  list", to `reload-log.txt`. Any other failure is shown as it is for a
-  background poll. The reload WidgetKit makes after the intent is the
+  screen), so after a press it shows the time of the press. A press made
+  just before or during a scheduled poll makes that poll its answer, under
+  a press's rules: the poll runs `--fresh`, and cached numbers it already
+  measured are never written, since the intent takes any newer snapshot
+  for its answer. A cswap from before `--fresh` refuses the option before
+  doing any work (argparse's exit status 2 and "error: unrecognized
+  arguments: --fresh" on stderr): the agent then measures the press once
+  more with the cached `cswap list --json` and writes one line, "press:
+  cswap has no --fresh; measured with the cached list", to
+  `reload-log.txt`. Any other failure is shown as it is for a background
+  poll. The reload WidgetKit makes after the intent is the
   press's own and is not budgeted. Only when the answer is written too
   late for the intent to see it (24.75 seconds or more after the press,
   judged once the answer is

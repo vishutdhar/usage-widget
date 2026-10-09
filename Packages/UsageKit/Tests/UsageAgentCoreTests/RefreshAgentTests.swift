@@ -432,8 +432,8 @@ final class RefreshAgentTests: XCTestCase {
     }
 
     /// A press that arrives while the minute's poll is due is answered by
-    /// that poll: the loop does not run cswap again for it, and no
-    /// completion reload follows.
+    /// that poll, which runs fresh for it: the loop does not run cswap
+    /// again, and no completion reload follows.
     func testAPressDuringADuePollIsAnsweredByThatPoll() async throws {
         let dir = try makeTemporaryDirectory()
         let clock = ManualClock(start)
@@ -448,6 +448,7 @@ final class RefreshAgentTests: XCTestCase {
         let taken = await agent.takeRefreshRequest()
         XCTAssertFalse(taken, "answered by the poll that just wrote")
         XCTAssertEqual(runner.calls - before, 1, "one cswap run for the press")
+        XCTAssertEqual(runner.freshFlags.last, true, "and it measured every account now")
         XCTAssertEqual(reloads.count, 1, "the first poll's only; no completion reload")
         clock.advance(40)
         try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
@@ -563,20 +564,24 @@ final class RefreshAgentTests: XCTestCase {
         }
     }
 
-    /// A scheduled poll that asks for a background reload of its own needs
-    /// no completion reload on top, however late it answers the press.
-    func testALatePressAnsweredByAReloadingPollGetsOneReload() async throws {
+    /// A scheduled poll that answers a late press, with a change it would
+    /// otherwise reload for, is the press's answer: no background decision,
+    /// and the one reload is the press's completion reload, not a
+    /// background reload with a completion reload on top.
+    func testALatePressAnsweredByAScheduledPollGetsOneReload() async throws {
         let dir = try makeTemporaryDirectory()
         let clock = ManualClock(start)
         let reloads = Counter()
-        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok(20), ok(30)]), reload: { reloads.increment() },
-                               clock: { clock.stamp })
+        let runner = ScriptedRunner([ok(20), ok(30)])
+        let agent = UsageAgent(directory: dir, runner: runner, reload: { reloads.increment() }, clock: { clock.stamp })
         _ = await agent.tick()
         clock.advance(11 * 60)
         try RefreshRequestStore.request(in: dir, at: clock.now.addingTimeInterval(-late))
         let report = await agent.tick()
-        XCTAssertEqual(reloads.count, 2, "the poll's own reload, and no second one")
-        XCTAssertFalse(report.reloadReasons.contains(.user))
+        XCTAssertEqual(runner.freshFlags, [false, true], "measured fresh for the press")
+        XCTAssertEqual(reloads.count, 2, "one reload for the poll, and no second one")
+        XCTAssertTrue(report.reloadReasons.contains(.user), "the press's completion reload")
+        XCTAssertTrue(try XCTUnwrap(try log(dir).split(separator: "\n").last).contains("kind=press"))
         XCTAssertEqual(state(dir)?.requests.count, 2)
     }
 
@@ -743,8 +748,9 @@ final class RefreshAgentTests: XCTestCase {
         XCTAssertTrue(taken, "the next press is taken")
     }
 
-    /// A press the poll's snapshot does not answer (made after that write)
-    /// is left for the loop to take.
+    /// A press a press's snapshot does not answer (made after that write)
+    /// is left for the loop to take. (A scheduled poll's cached snapshot
+    /// answers no press at all.)
     func testAPressNotAnsweredByThePollIsLeftToTake() async throws {
         let dir = try makeTemporaryDirectory()
         let clock = ManualClock(start)
@@ -752,14 +758,19 @@ final class RefreshAgentTests: XCTestCase {
         _ = await agent.tick()
         let written = try XCTUnwrap(SnapshotStore.read(from: dir.appendingPathComponent("snapshot.json")))
         let writer = await agent.currentWriterId
-        // Made after the next write: it names that write's number as seen.
-        let request = RefreshRequest(requestedAt: clock.now, sequence: 1, session: "s",
+        clock.advance(60)
+        let first = try RefreshRequestStore.request(in: dir, at: clock.now)
+        let took = await agent.takeRefreshRequest()
+        XCTAssertTrue(took)
+        // The next press, made after the answer's write: it names that
+        // write's number as seen.
+        let request = RefreshRequest(requestedAt: clock.now, sequence: first.sequence + 1, session: first.session,
                                      afterSnapshot: (written.writeSequence ?? 0) + 1, afterWriter: writer)
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .secondsSince1970
         try encoder.encode(request).write(to: dir.appendingPathComponent(RefreshRequestStore.fileName))
-        clock.advance(60)
-        _ = await agent.tick()
+        _ = await agent.tick(userRequested: true)
+        clock.advance(31)
         let taken = await agent.takeRefreshRequest()
         XCTAssertTrue(taken, "not answered by that poll, so still a press to take")
     }

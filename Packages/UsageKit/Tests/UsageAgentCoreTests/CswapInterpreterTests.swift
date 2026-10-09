@@ -45,24 +45,31 @@ final class CswapInterpreterTests: XCTestCase {
         XCTAssertTrue(text.hasSuffix("…"))
     }
 
-    /// A run with `--fresh` that this cswap refused: a non-zero exit with
-    /// argparse's "unrecognized arguments", or an "error:" line naming
-    /// --fresh, on stderr or stdout. Anything else is a real failure.
-    func testARefusedFreshOptionIsToldApartFromOtherFailures() {
+    /// A run with `--fresh` that this cswap refused, and nothing else:
+    /// argparse's own refusal, exit status 2 and a stderr line
+    /// "error: unrecognized arguments:" whose arguments include --fresh.
+    /// Every other exit, text or stream is the ordinary error path.
+    func testOnlyArgparsesRefusalOfFreshCounts() {
         func run(_ code: Int32, out: String = "", err: String = "") -> Result<RunOutput, RunFailure> {
             .success(RunOutput(exitCode: code, stdout: Data(out.utf8), stderr: Data(err.utf8)))
         }
         let argparse = "usage: cswap <command> [args] [options]\ncswap: error: unrecognized arguments: --fresh\n"
         XCTAssertTrue(CswapInterpreter.rejectsFresh(run(2, err: argparse)), "the installed cswap, verbatim")
-        XCTAssertTrue(CswapInterpreter.rejectsFresh(run(2, out: argparse)), "on stdout")
-        XCTAssertTrue(CswapInterpreter.rejectsFresh(run(2, err: "unrecognized arguments: --fresh\n")), "argparse's words alone")
-        XCTAssertTrue(CswapInterpreter.rejectsFresh(run(2, err: "cswap: error: argument --fresh: not allowed with argument --token-status\n")))
-        XCTAssertTrue(CswapInterpreter.rejectsFresh(run(2, err: "Error: No such option: --fresh\n")))
+        XCTAssertTrue(CswapInterpreter.rejectsFresh(run(2, err: "cswap: error: unrecognized arguments: --json2 --fresh\n")),
+                      "--fresh among several")
 
-        XCTAssertFalse(CswapInterpreter.rejectsFresh(run(0, out: "{}", err: argparse)), "a zero exit is not a refusal")
+        XCTAssertFalse(CswapInterpreter.rejectsFresh(run(1, err: "RuntimeError: --fresh failed: network unreachable\n")),
+                       "a failure that names --fresh")
+        XCTAssertFalse(CswapInterpreter.rejectsFresh(run(2, err: "cswap: error: unrecognized arguments: --freshness\n")),
+                       "unrecognized arguments that do not include --fresh")
+        XCTAssertFalse(CswapInterpreter.rejectsFresh(run(2, err: "cswap: error: argument --fresh: not allowed with argument --token-status\n")),
+                       "an argument conflict")
+        XCTAssertFalse(CswapInterpreter.rejectsFresh(run(2, out: argparse)), "argparse's refusal goes to stderr")
+        XCTAssertFalse(CswapInterpreter.rejectsFresh(run(1, err: argparse)), "exit status 1")
+        XCTAssertFalse(CswapInterpreter.rejectsFresh(run(0, out: "{}", err: argparse)), "a zero exit")
+        XCTAssertFalse(CswapInterpreter.rejectsFresh(run(2, err: "unrecognized arguments: --fresh\n")), "not argparse's error line")
+        XCTAssertFalse(CswapInterpreter.rejectsFresh(run(2, err: "Error: No such option: --fresh\n")))
         XCTAssertFalse(CswapInterpreter.rejectsFresh(run(1, err: "Traceback (most recent call last):\nRuntimeError: keychain locked\n")))
-        XCTAssertFalse(CswapInterpreter.rejectsFresh(run(1, err: "measuring every account (--fresh)\nerror: network unreachable\n")),
-                       "--fresh and an error on different lines is a real failure")
         XCTAssertFalse(CswapInterpreter.rejectsFresh(run(1, out: #"{"schemaVersion": 1, "error": {"type": "X", "message": "No accounts yet"}}"#)))
         XCTAssertFalse(CswapInterpreter.rejectsFresh(.failure(.timedOut(50))))
         XCTAssertFalse(CswapInterpreter.rejectsFresh(.failure(.notFound)))
