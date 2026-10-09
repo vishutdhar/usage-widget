@@ -332,6 +332,37 @@ final class PressFreshTests: XCTestCase {
         XCTAssertEqual(log(dir).filter { $0.contains("answered with the last snapshot") }, [], "no second write for it")
     }
 
+    /// A background poll after a press's answer carries the answer forward:
+    /// its snapshot still names the press, so a timeline built from it while
+    /// the press's 90 s still run says "as of", not "Refreshing…" again.
+    func testABackgroundPollAfterAnAnswerKeepsThePressAnswered() async throws {
+        let dir = try makeTemporaryDirectory()
+        let clock = ManualClock(start)
+        let runner = ScriptedRunner([ok()])
+        let agent = UsageAgent(directory: dir, runner: runner, reload: {}, clock: { clock.stamp })
+        _ = await agent.tick()
+        clock.advance(60)
+        let request = try RefreshRequestStore.request(in: dir, at: clock.now)
+        let taken = await agent.takeRefreshRequest()
+        XCTAssertTrue(taken)
+        _ = await agent.tick(userRequested: true)
+        let url = dir.appendingPathComponent(SharedContainer.snapshotFileName)
+        let answer = try XCTUnwrap(SnapshotStore.read(from: url))
+        XCTAssertEqual(answer.answeredPress, AnsweredPress(request))
+
+        clock.advance(60)
+        _ = await agent.tick()
+        XCTAssertEqual(runner.freshFlags, [false, true, false], "then a background poll")
+        let background = try XCTUnwrap(SnapshotStore.read(from: url))
+        XCTAssertGreaterThan(background.writeSequence ?? 0, answer.writeSequence ?? 0, "a new snapshot")
+        XCTAssertEqual(background.answeredPress, AnsweredPress(request), "it still names the press")
+        XCTAssertLessThan(clock.now.timeIntervalSince(request.requestedAt), RefreshState.window, "inside the press's 90 s")
+        let entries = WidgetContent.timelineEntries(for: background, readAt: clock.now, refresh: request)
+        XCTAssertEqual(entries.first?.content.refreshFooter, RefreshFooter.none, "not Refreshing again")
+        XCTAssertFalse(TimelinePlan.plan(for: background, now: clock.now, refresh: request).entries
+            .contains(request.requestedAt.addingTimeInterval(RefreshState.window)))
+    }
+
     /// A press taken and not yet answered when a scheduled poll runs is
     /// answered by that poll, fresh.
     func testAPressTakenButNotYetAnsweredIsAnsweredFreshByTheNextPoll() async throws {
