@@ -143,11 +143,22 @@ codex app-server, at most 8 a day
 - **Refresh button**: a circular arrow at the right of both sizes' footer.
   Its intent only writes `refresh-request.json` into the group container
   (the extension never runs a process), and WidgetKit reloads the widget as
-  the intent returns. The agent looks for a request every 2 seconds and
-  answers with an immediate `cswap list --json` and a new snapshot. The
-  reload WidgetKit makes after the intent is the press's own and is not
-  budgeted. Only when the answer is written too late for the intent to see
-  it (24.75 seconds or more after the press, judged once the answer is
+  the intent returns. The agent answers with an immediate
+  `cswap list --json --fresh` and a new snapshot. `--fresh` makes cswap
+  re-measure every account now (it serves as they are only the accounts it
+  is holding back: quarantined, backing off after a 429, or claimed),
+  where a background poll's `cswap list --json` serves an account's cached
+  numbers while they are younger than cswap's serve time (3 to 10
+  minutes). The "as of" line keeps its rule (the oldest measurement on
+  screen), so after a press it shows the time of the press. A cswap from
+  before `--fresh` refuses the option before doing any work: the agent then
+  measures the press once more with the cached `cswap list --json` and
+  writes one line, "press: cswap has no --fresh; measured with the cached
+  list", to `reload-log.txt`. Any other failure is shown as it is for a
+  background poll. The reload WidgetKit makes after the intent is the
+  press's own and is not budgeted. Only when the answer is written too
+  late for the intent to see it (24.75 seconds or more after the press,
+  judged once the answer is
   written) does the agent add one completion reload, at most one every 10
   minutes, which takes a token (borrowing one from an empty bucket, one
   debt at most) and counts like any background reload, so presses cannot
@@ -368,9 +379,11 @@ refreshes. Nothing in the app measures or adapts to this; the cap is fixed.
 - **Refresh budget.** WidgetKit decides when a widget actually reloads. The
   agent asks at most 40 times a day and the widget's own timeline at most
   8, so a change can take 10 minutes to appear, longer once the 40 are
-  spent or if macOS is stricter; the refresh button shows fresh numbers at
-  once. The "as of" line always says when
-  the numbers on screen were measured.
+  spent or if macOS is stricter. The refresh button re-measures every
+  account (`cswap list --json --fresh`; with a cswap from before that
+  option, the cached list) and shows the numbers at once, through the
+  intent's own reload, which is not budgeted. The "as of" line always says
+  when the numbers on screen were measured.
 
 ## Tests
 

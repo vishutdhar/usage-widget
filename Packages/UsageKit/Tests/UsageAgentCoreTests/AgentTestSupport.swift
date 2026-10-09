@@ -17,6 +17,18 @@ func makeScript(_ body: String) throws -> URL {
     return url
 }
 
+/// A fake cswap at `home/.local/bin/cswap`, the first place the locator
+/// looks, so a `ProcessCswapRunner` given that home runs it. Returns the home.
+func makeCswapHome(_ body: String) throws -> URL {
+    let home = try makeTemporaryDirectory()
+    let bin = home.appendingPathComponent(".local/bin", isDirectory: true)
+    try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+    let url = bin.appendingPathComponent("cswap")
+    try Data("#!/bin/sh\n\(body)\n".utf8).write(to: url)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    return home
+}
+
 /// cswap list --json output with one account per (id, active, fiveHourPct).
 func listJSON(_ accounts: [(String, Bool, Double)], schema: Int = 1) -> Data {
     let rows = accounts.map { id, active, pct in
@@ -40,16 +52,16 @@ final class ScriptedRunner: CswapRunning, @unchecked Sendable {
     }
 
     private var count = 0
+    private var flags: [Bool] = []
     /// How many times cswap was run.
     var calls: Int { lock.withLock { count } }
+    /// Whether each run asked for a fresh list, in order.
+    var freshFlags: [Bool] { lock.withLock { flags } }
 
-    func runList() async -> Result<RunOutput, RunFailure> {
-        next()
-    }
-
-    private func next() -> Result<RunOutput, RunFailure> {
+    func runList(fresh: Bool) async -> Result<RunOutput, RunFailure> {
         lock.withLock {
             count += 1
+            flags.append(fresh)
             return results.count > 1 ? results.removeFirst() : results[0]
         }
     }

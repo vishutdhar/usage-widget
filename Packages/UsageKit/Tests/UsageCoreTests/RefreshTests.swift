@@ -241,6 +241,44 @@ final class RefreshPressTests: XCTestCase {
         XCTAssertEqual(content.sections[0].accounts[0].rows[0].percentText, "77%")
     }
 
+    /// A press re-measures every account (`cswap list --json --fresh`), so
+    /// every account in its answer was measured within seconds of the
+    /// press. The footer keeps its rule, the oldest current measurement on
+    /// screen, and so shows the press's own minute: nothing between the
+    /// snapshot and the "as of" text rounds it back or holds an older time.
+    func testAFreshPressDatesTheFooterAtThePress() throws {
+        let pressedAt = utc(2026, 10, 9, 16, 8, 10)
+        let measured = [utc(2026, 10, 9, 16, 8, 13), utc(2026, 10, 9, 16, 8, 19), utc(2026, 10, 9, 16, 8, 51)]
+        let rows = ["16:08:13", "16:08:19", "16:08:51"].enumerated().map { i, time in
+            """
+            {"number": \(i + 1), "email": "user\(i + 1)@example.com", "active": \(i == 0), "usageStatus": "ok",
+             "usage": {"fiveHour": {"pct": 20.0, "resetsAt": "2026-10-09T20:00:00+00:00"},
+                       "sevenDay": {"pct": 50.0, "resetsAt": "2026-10-14T00:00:00+00:00"}},
+             "usageFetchedAt": "2026-10-09T\(time)Z"}
+            """
+        }
+        let list = Data("{\"schemaVersion\": 1, \"accounts\": [\(rows.joined(separator: ","))]}".utf8)
+        let accounts = try CswapListMapper.accounts(from: list)
+        XCTAssertEqual(accounts.compactMap(\.fetchedAt), measured)
+        XCTAssertTrue(measured.allSatisfy { abs($0.timeIntervalSince(pressedAt)) < 60 }, "all within 60 s of the press")
+
+        let request = RefreshRequest(requestedAt: pressedAt, sequence: 4, session: "s", afterSnapshot: 5, afterWriter: "w")
+        var snapshot = SnapshotBuilder.updating(nil, provider: CswapListMapper.provider, source: CswapListMapper.source,
+                                                outcome: .success(accounts), now: utc(2026, 10, 9, 16, 8, 54))
+        snapshot.writeSequence = 6
+        snapshot.writerId = "w"
+        let entries = WidgetContent.timelineEntries(for: snapshot, readAt: utc(2026, 10, 9, 16, 8, 55), refresh: request)
+        let entry = try XCTUnwrap(entries.first)
+        XCTAssertEqual(entry.content.refreshFooter, .none, "the press is answered")
+        let shown = entry.content.sections.flatMap(\.accounts)
+        XCTAssertEqual(shown.count, 3)
+        let footer = try XCTUnwrap(entry.content.footerTime(for: shown))
+        XCTAssertEqual(footer, utc(2026, 10, 9, 16, 8, 13), "the oldest fresh measurement, as measured")
+        XCTAssertEqual(TimeText.asOf(footer, relativeTo: entry.date, locale: Locale(identifier: "en_US_POSIX"),
+                                     timeZone: TimeZone(identifier: "UTC")!, calendar: Calendar(identifier: .gregorian)),
+                       "as of 4:08\u{202F}PM", "the press's own minute")
+    }
+
     /// No shipped source says anything about a refresh limit.
     func testNothingMentionsARefreshLimit() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()

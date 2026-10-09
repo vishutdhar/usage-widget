@@ -410,6 +410,29 @@ public actor UsageAgent {
         return (press, id, reasons)
     }
 
+    /// Logged when a press falls back to the cached list.
+    public static let noFreshLogLine = "press: cswap has no --fresh; measured with the cached list"
+
+    /// The cswap run of a poll. A press re-measures every account
+    /// (`--fresh`); a background poll takes cswap's cached list. A cswap
+    /// from before `--fresh` refuses the option before doing any work: the
+    /// press is then measured with the cached list, once, and the reload
+    /// log says so. Any other failure is the press's answer, as for a poll.
+    private func runCswap(userRequested: Bool) async -> Result<RunOutput, RunFailure> {
+        let result = await runCswap(fresh: userRequested)
+        guard userRequested, CswapInterpreter.rejectsFresh(result) else { return result }
+        try? CappedLog.append("\(ISODate.format(clock().wall)) \(Self.noFreshLogLine)", to: reloadLogURL,
+                              cap: SharedContainer.logCap)
+        return await runCswap(fresh: false)
+    }
+
+    /// One cswap run; a helper left holding its output is counted.
+    private func runCswap(fresh: Bool) async -> Result<RunOutput, RunFailure> {
+        let result = await runner.runList(fresh: fresh)
+        if case .success(let output) = result, output.leftHelper { helperWarnings += 1 }
+        return result
+    }
+
     /// A report for an agent that has stopped: no poll, no write.
     private static func stoppedReport(at now: Date) -> TickReport {
         var report = TickReport(writtenAt: now, status: .error, error: nil, reloadReasons: [])
@@ -418,8 +441,9 @@ public actor UsageAgent {
         return report
     }
 
-    /// One poll. With `userRequested`, the reload that follows skips the
-    /// spacing (it still counts toward the daily cap).
+    /// One poll. With `userRequested` (a press), cswap re-measures every
+    /// account (`runCswap`), and the reload that follows skips the spacing
+    /// (it still counts toward the daily cap).
     public func tick(userRequested: Bool) async -> TickReport {
         // The container is anchored once at launch. Another folder at its
         // path stops the agent for good: no poll, no write into either
@@ -477,8 +501,7 @@ public actor UsageAgent {
             loaded = true
         }
 
-        let result = await runner.runList()
-        if case .success(let output) = result, output.leftHelper { helperWarnings += 1 }
+        let result = await runCswap(userRequested: userRequested)
         let outcome = CswapInterpreter.interpret(result)
         let polled = clock()
         var built = SnapshotBuilder.updating(

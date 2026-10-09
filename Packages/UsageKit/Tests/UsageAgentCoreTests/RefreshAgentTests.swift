@@ -1119,7 +1119,7 @@ final class WriterAgentTests: XCTestCase {
 final class AlternatingRunner: CswapRunning, @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
-    func runList() async -> Result<RunOutput, RunFailure> {
+    func runList(fresh: Bool) async -> Result<RunOutput, RunFailure> {
         let pct = lock.withLock { () -> Double in
             count += 1
             return count % 2 == 0 ? 30 : 20
@@ -1151,7 +1151,7 @@ final class SlowRunner: CswapRunning, @unchecked Sendable {
         self.seconds = seconds
     }
 
-    func runList() async -> Result<RunOutput, RunFailure> {
+    func runList(fresh: Bool) async -> Result<RunOutput, RunFailure> {
         if slow.on { clock.advance(seconds) }
         return .success(RunOutput(exitCode: 0, stdout: listJSON([("1", true, 20)])))
     }

@@ -22,10 +22,12 @@ public enum RunFailure: Error, Equatable, Sendable {
 }
 
 public protocol CswapRunning: Sendable {
-    func runList() async -> Result<RunOutput, RunFailure>
+    /// One `cswap list --json`. With `fresh`, `cswap list --json --fresh`:
+    /// a press's run, which re-measures every account now.
+    func runList(fresh: Bool) async -> Result<RunOutput, RunFailure>
 }
 
-/// Runs `cswap list --json` as a child process.
+/// Runs `cswap list --json` (with `--fresh` for a press) as a child process.
 ///
 /// The child is spawned as the leader of its own process group, so a
 /// timeout or an oversized reply signals everything cswap started, not just
@@ -36,7 +38,13 @@ public protocol CswapRunning: Sendable {
 public struct ProcessCswapRunner: CswapRunning {
     public var locator: CswapLocator
     public var timeout: TimeInterval
+    /// A background poll: cswap serves an account's cached numbers while
+    /// they are younger than its serve time (3 to 10 minutes).
     public static let arguments = ["list", "--json"]
+    /// A press: cswap re-measures every account now, except those it holds
+    /// back (quarantined, backing off after a 429, or claimed), which it
+    /// serves as they are.
+    public static let freshArguments = ["list", "--json", "--fresh"]
     /// A real reading is a few kilobytes; anything past this is not one.
     public static let stdoutCap = 2 * 1024 * 1024
     /// Only the end of stderr is kept, where a traceback's message is.
@@ -58,11 +66,12 @@ public struct ProcessCswapRunner: CswapRunning {
         self.warn = warn
     }
 
-    public func runList() async -> Result<RunOutput, RunFailure> {
+    public func runList(fresh: Bool) async -> Result<RunOutput, RunFailure> {
         guard let executable = locator.resolve() else { return .failure(.notFound) }
+        let arguments = fresh ? Self.freshArguments : Self.arguments
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
-                continuation.resume(returning: run(executable: executable))
+                continuation.resume(returning: run(executable: executable, arguments: arguments))
             }
         }
     }

@@ -159,8 +159,20 @@ final class ProcessCswapRunnerTests: XCTestCase {
         // The fixed system paths may hold a real cswap on a developer machine;
         // only assert when none of them exist.
         guard runner.locator.resolve() == nil else { throw XCTSkip("cswap is installed at a system path") }
-        let result = await runner.runList()
+        let result = await runner.runList(fresh: false)
         XCTAssertEqual(result, .failure(.notFound))
+    }
+
+    /// A press asks cswap to measure every account now (`--fresh`); a
+    /// background poll takes its cached list. The fake cswap prints each
+    /// argument on its own line, so the exact argument list is pinned.
+    func testAFreshListAddsTheFreshOption() async throws {
+        let home = try makeCswapHome(#"printf '%s\n' "$@""#)
+        let runner = ProcessCswapRunner(locator: CswapLocator(home: home))
+        let fresh = try await runner.runList(fresh: true).get()
+        XCTAssertEqual(String(decoding: fresh.stdout, as: UTF8.self), "list\n--json\n--fresh\n")
+        let cached = try await runner.runList(fresh: false).get()
+        XCTAssertEqual(String(decoding: cached.stdout, as: UTF8.self), "list\n--json\n")
     }
 
     func testChildSeesTheInstallDirectoriesOnItsPath() throws {

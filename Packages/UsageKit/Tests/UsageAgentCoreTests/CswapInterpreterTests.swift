@@ -45,6 +45,29 @@ final class CswapInterpreterTests: XCTestCase {
         XCTAssertTrue(text.hasSuffix("…"))
     }
 
+    /// A run with `--fresh` that this cswap refused: a non-zero exit with
+    /// argparse's "unrecognized arguments", or an "error:" line naming
+    /// --fresh, on stderr or stdout. Anything else is a real failure.
+    func testARefusedFreshOptionIsToldApartFromOtherFailures() {
+        func run(_ code: Int32, out: String = "", err: String = "") -> Result<RunOutput, RunFailure> {
+            .success(RunOutput(exitCode: code, stdout: Data(out.utf8), stderr: Data(err.utf8)))
+        }
+        let argparse = "usage: cswap <command> [args] [options]\ncswap: error: unrecognized arguments: --fresh\n"
+        XCTAssertTrue(CswapInterpreter.rejectsFresh(run(2, err: argparse)), "the installed cswap, verbatim")
+        XCTAssertTrue(CswapInterpreter.rejectsFresh(run(2, out: argparse)), "on stdout")
+        XCTAssertTrue(CswapInterpreter.rejectsFresh(run(2, err: "unrecognized arguments: --fresh\n")), "argparse's words alone")
+        XCTAssertTrue(CswapInterpreter.rejectsFresh(run(2, err: "cswap: error: argument --fresh: not allowed with argument --token-status\n")))
+        XCTAssertTrue(CswapInterpreter.rejectsFresh(run(2, err: "Error: No such option: --fresh\n")))
+
+        XCTAssertFalse(CswapInterpreter.rejectsFresh(run(0, out: "{}", err: argparse)), "a zero exit is not a refusal")
+        XCTAssertFalse(CswapInterpreter.rejectsFresh(run(1, err: "Traceback (most recent call last):\nRuntimeError: keychain locked\n")))
+        XCTAssertFalse(CswapInterpreter.rejectsFresh(run(1, err: "measuring every account (--fresh)\nerror: network unreachable\n")),
+                       "--fresh and an error on different lines is a real failure")
+        XCTAssertFalse(CswapInterpreter.rejectsFresh(run(1, out: #"{"schemaVersion": 1, "error": {"type": "X", "message": "No accounts yet"}}"#)))
+        XCTAssertFalse(CswapInterpreter.rejectsFresh(.failure(.timedOut(50))))
+        XCTAssertFalse(CswapInterpreter.rejectsFresh(.failure(.notFound)))
+    }
+
     func testMultilineMessageBecomesOneLine() throws {
         let envelope = Data(#"{"schemaVersion": 1, "error": {"type": "X", "message": "first\nsecond"}}"#.utf8)
         XCTAssertEqual(reason(.success(RunOutput(exitCode: 1, stdout: envelope))), "cswap: first second")

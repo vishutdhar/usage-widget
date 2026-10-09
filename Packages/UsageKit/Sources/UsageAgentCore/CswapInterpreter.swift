@@ -34,6 +34,22 @@ public enum CswapInterpreter {
         }
     }
 
+    /// True when a `--fresh` run failed only because this cswap does not
+    /// know the option (a build from before it): a non-zero exit whose
+    /// stderr or stdout carries argparse's "unrecognized arguments", or an
+    /// "error:" line naming --fresh after it. cswap parses its arguments
+    /// before doing anything, so such a run measured nothing. Every other
+    /// failure is a real one.
+    public static func rejectsFresh(_ result: Result<RunOutput, RunFailure>) -> Bool {
+        guard case .success(let output) = result, output.exitCode != 0 else { return false }
+        let text = String(decoding: output.stderr, as: UTF8.self) + "\n" + String(decoding: output.stdout, as: UTF8.self)
+        return text.split(whereSeparator: \.isNewline).contains { line in
+            if line.contains("unrecognized arguments") { return true }
+            guard let error = line.range(of: "error:", options: .caseInsensitive) else { return false }
+            return line[error.upperBound...].contains("--fresh")
+        }
+    }
+
     static func reason(for failure: RunFailure) -> String {
         switch failure {
         case .notFound:
