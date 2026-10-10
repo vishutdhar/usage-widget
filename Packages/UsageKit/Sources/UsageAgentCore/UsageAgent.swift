@@ -124,9 +124,13 @@ public actor UsageAgent {
         self.runner = runner
         self.reload = reload
         self.clock = clock
-        self.launch = clock()
+        // The files first, then the launch time: a press landing between
+        // the two is not on disk yet, so it counts as made after launch and
+        // is taken. Sampled the other way round it could be dated after the
+        // launch and be thought old.
         let onDisk = RefreshRequestStore.read(in: directory)
         let snapshot = SnapshotStore.read(from: directory.appendingPathComponent(SharedContainer.snapshotFileName))
+        self.launch = clock()
         if let onDisk, Self.isLive(onDisk, snapshot: snapshot, at: launch.wall) {
             // Left unseen: the first poll takes it under press rules.
             self.lastSeenRefresh = (onDisk.session, onDisk.sequence - 1)
@@ -141,11 +145,18 @@ public actor UsageAgent {
     /// inside its "Refreshing…" window (`RefreshState.window`), with no
     /// snapshot naming it. The agent restarted between the press and its
     /// answer; the intent has returned and the widget says "Refreshing…",
-    /// so the press is answered fresh, with its reload, like any other.
+    /// so the press is answered fresh, with its reload, like any other. A
+    /// press stamped up to `launchSkew` after the launch time counts too
+    /// (one landing as the agent starts, or the clock's own granularity).
     /// Every other press on disk at launch is old: seen, never taken.
     static func isLive(_ request: RefreshRequest, snapshot: UsageSnapshot?, at date: Date) -> Bool {
-        RefreshState.isUserReload(request, at: date) && !RefreshState.answers(snapshot, request)
+        let age = date.timeIntervalSince(request.requestedAt)
+        return age >= -launchSkew && age < RefreshState.window && !RefreshState.answers(snapshot, request)
     }
+
+    /// How far after the launch time a press on disk may be stamped and
+    /// still count as live.
+    static let launchSkew: TimeInterval = 5
 
     /// A press numbered past the last one seen in its session (a new
     /// session counts from 0).

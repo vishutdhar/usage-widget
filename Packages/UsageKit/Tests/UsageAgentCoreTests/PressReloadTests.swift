@@ -195,6 +195,48 @@ final class PressReloadTests: XCTestCase {
         }
     }
 
+    /// A press stamped just after the agent sampled its launch time (one
+    /// landing as the agent starts, or the clock's own granularity) is
+    /// live, not old: answered fresh with its reload, and the footer clears.
+    func testAPressStampedJustAfterLaunchIsLive() async throws {
+        let dir = try makeTemporaryDirectory()
+        let request = try RefreshRequestStore.request(in: dir, at: start.addingTimeInterval(1))
+        let clock = ManualClock(start)
+        let runner = ScriptedRunner([ok(40, fetchedAt: start)])
+        let reloads = Counter()
+        let agent = UsageAgent(directory: dir, runner: runner, reload: { reloads.increment() }, clock: { clock.stamp })
+        let report = await agent.tick()
+        XCTAssertEqual(runner.freshFlags, [true], "taken live: a fresh run")
+        XCTAssertTrue(report.reloadReasons.contains(.user), "with the press reload")
+        XCTAssertEqual(pressLines(dir).count, 1)
+        XCTAssertTrue(RefreshState.answers(snapshot(dir), request))
+        let content = WidgetContent.make(snapshot: snapshot(dir), at: start.addingTimeInterval(2), refresh: request)
+        XCTAssertEqual(content.refreshFooter, RefreshFooter.none, "the footer clears")
+        XCTAssertEqual(content.footerTime(for: content.sections.flatMap(\.accounts)), start)
+    }
+
+    /// The agent reads the request file before it samples its launch time,
+    /// so a press landing between the two is a press made after launch and
+    /// is taken. Here it is written on the launch clock reading itself and
+    /// stamped well past any skew: it is still answered fresh, with its
+    /// reload.
+    func testAPressLandingAsTheAgentStartsIsTaken() async throws {
+        let dir = try makeTemporaryDirectory()
+        let clock = ManualClock(start)
+        let hook = ClockHook()
+        let made = RequestBox()
+        let stamped = start.addingTimeInterval(10)
+        hook.arm(onRead: 1) { made.set(try? RefreshRequestStore.request(in: dir, at: stamped)) }
+        let runner = ScriptedRunner([ok()])
+        let agent = UsageAgent(directory: dir, runner: runner, reload: {}, clock: { hook.read(); return clock.stamp })
+        let report = await agent.tick()
+        let request = try XCTUnwrap(made.value, "made on the launch clock reading")
+        XCTAssertEqual(runner.freshFlags, [true], "taken: a fresh run")
+        XCTAssertTrue(report.reloadReasons.contains(.user), "with the press reload")
+        XCTAssertEqual(pressLines(dir).count, 1)
+        XCTAssertTrue(RefreshState.answers(snapshot(dir), request))
+    }
+
     /// With the day's background requests at the ceiling, a press is
     /// answered fresh and reloaded, and a second press 10 s later gets the
     /// debounced answer and its own reload too: the cap holds neither.
