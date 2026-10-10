@@ -135,16 +135,93 @@ final class PressReloadTests: XCTestCase {
         XCTAssertEqual(pressLines(dir), [])
 
         let other = try makeTemporaryDirectory()
-        try RefreshRequestStore.request(in: other, at: start.addingTimeInterval(-20))
+        try RefreshRequestStore.request(in: other, at: clock.now.addingTimeInterval(-120))
         let restarted = UsageAgent(directory: other, runner: ScriptedRunner([ok()]), reload: { reloads.increment() },
                                    clock: { clock.stamp })
         for _ in 0..<3 {
             _ = await restarted.tick()
             let none = await restarted.takeRefreshRequest()
-            XCTAssertFalse(none, "made before launch")
+            XCTAssertFalse(none, "made before launch, past its window")
             clock.advance(60)
         }
-        XCTAssertEqual(pressLines(other), [], "no press reload for a press from before launch")
+        XCTAssertEqual(pressLines(other), [], "no press reload for a press past its window at launch")
+    }
+
+    /// The agent restarted between a press and its answer (the intent has
+    /// returned and the widget says "Refreshing…"). A press still inside
+    /// its 90 s window that no snapshot names is taken as a live press: the
+    /// first poll runs fresh under press rules, asks for the press reload,
+    /// and the footer clears. One that a snapshot already names, or one
+    /// past its window, is old: no fresh run, no press reload, and the
+    /// footer shows the last measured time.
+    func testARestartBetweenAPressAndItsAnswerStillAnswersIt() async throws {
+        let measuredBefore = start.addingTimeInterval(-600)
+        for (age, named, live) in [(20.0, false, true), (20.0, true, false), (120.0, false, false)] {
+            let name = "pressed \(Int(age)) s before launch\(named ? ", already answered" : "")"
+            let dir = try makeTemporaryDirectory()
+            try SnapshotStore.write(UsageSnapshot(writtenAt: measuredBefore, providers: [
+                ProviderUsage(provider: CswapListMapper.provider, source: CswapListMapper.source, status: .ok,
+                              accounts: [AccountUsage(id: "1", label: "a", active: true, fetchedAt: measuredBefore,
+                                                      windows: [UsageWindow(kind: .weekly, name: "7d",
+                                                                            windowSeconds: 604_800, usedPct: 10)])]),
+            ], writeSequence: 3, writerId: "OLD"), to: dir.appendingPathComponent(SharedContainer.snapshotFileName))
+            let request = try RefreshRequestStore.request(in: dir, at: start.addingTimeInterval(-age))
+            if named {
+                var answered = try XCTUnwrap(snapshot(dir))
+                answered.answeredPress = AnsweredPress(request)
+                try SnapshotStore.write(answered, to: dir.appendingPathComponent(SharedContainer.snapshotFileName))
+            }
+            let clock = ManualClock(start)
+            let runner = ScriptedRunner([ok(40, fetchedAt: start)])
+            let reloads = Counter()
+            let agent = UsageAgent(directory: dir, runner: runner, reload: { reloads.increment() }, clock: { clock.stamp })
+            let report = await agent.tick()
+            let content = WidgetContent.make(snapshot: snapshot(dir), at: clock.now, refresh: request)
+            if live {
+                XCTAssertEqual(runner.freshFlags, [true], "\(name): the first poll runs fresh")
+                XCTAssertTrue(report.reloadReasons.contains(.user), "\(name): with the press reload")
+                XCTAssertEqual(pressLines(dir).count, 1, name)
+                XCTAssertTrue(RefreshState.answers(snapshot(dir), request), name)
+                XCTAssertEqual(content.refreshFooter, RefreshFooter.none, "\(name): the footer clears")
+                XCTAssertEqual(content.footerTime(for: content.sections.flatMap(\.accounts)), start, name)
+            } else {
+                XCTAssertEqual(runner.freshFlags, [false], "\(name): no fresh run")
+                XCTAssertFalse(report.reloadReasons.contains(.user), name)
+                XCTAssertEqual(pressLines(dir), [], "\(name): no press reload")
+                XCTAssertEqual(content.refreshFooter, RefreshFooter.none, "\(name): no Refreshing")
+            }
+            let again = await agent.takeRefreshRequest()
+            XCTAssertFalse(again, "\(name): not taken again")
+        }
+    }
+
+    /// With the reload state unwritable, a press is answered and reloaded,
+    /// and a second press 10 s later gets the debounced answer and its own
+    /// reload too: neither waits on its record being saved.
+    func testADebouncedAnswerReloadsWhileTheStateCannotBeSaved() async throws {
+        let dir = try makeTemporaryDirectory()
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent(ReloadStateStore.fileName),
+                                                withIntermediateDirectories: true)
+        let clock = ManualClock(start)
+        let runner = ScriptedRunner([ok()])
+        let reloads = Counter()
+        let agent = UsageAgent(directory: dir, runner: runner, reload: { reloads.increment() }, clock: { clock.stamp })
+        let first = await agent.tick()
+        XCTAssertNotNil(first.stateError, "the state cannot be saved")
+        clock.advance(60)
+        try RefreshRequestStore.request(in: dir, at: clock.now)
+        let taken = await agent.takeRefreshRequest()
+        XCTAssertTrue(taken)
+        _ = await agent.tick(userRequested: true)
+        let afterFirst = reloads.count
+        XCTAssertEqual(pressLines(dir).count, 1, "press A reloaded")
+        clock.advance(10)
+        let second = try RefreshRequestStore.request(in: dir, at: clock.now)
+        let again = await agent.takeRefreshRequest()
+        XCTAssertFalse(again, "inside the debounce")
+        XCTAssertTrue(RefreshState.answers(snapshot(dir), second), "press B answered from the last snapshot")
+        XCTAssertEqual(reloads.count, afterFirst + 1, "and reloaded though nothing can be saved")
+        XCTAssertEqual(pressLines(dir).count, 2)
     }
 
     /// The footer across one press, the intent's write first: "Refreshing…"

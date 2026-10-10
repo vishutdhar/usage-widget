@@ -73,13 +73,13 @@ public actor UsageAgent {
     private var stateError: String?
     private var loaded = false
     private var helperWarnings = 0
-    /// The session and number of the last press seen; presses on disk at
-    /// launch are old.
+    /// The session and number of the last press seen. A press on disk at
+    /// launch is old, unless it is still live (`isLive`).
     private var lastSeenRefresh: (session: String, sequence: Int)
     /// The newest press answered, which every snapshot written carries
     /// (`UsageSnapshot.answeredPress`): a press's poll names the press it
-    /// measured for, any other write carries this forward. At launch, the
-    /// press on disk (old, so counted as answered), else the snapshot's.
+    /// measured for, any other write carries this forward. At launch, an
+    /// old press on disk (so counted as answered), else the snapshot's.
     private var answeredPress: AnsweredPress?
     private let pressAtLaunch: AnsweredPress?
     private var lastUserRefresh: SchedulerClock?
@@ -126,8 +126,25 @@ public actor UsageAgent {
         self.clock = clock
         self.launch = clock()
         let onDisk = RefreshRequestStore.read(in: directory)
-        self.lastSeenRefresh = (onDisk?.session ?? "", onDisk?.sequence ?? 0)
-        self.pressAtLaunch = onDisk.map(AnsweredPress.init)
+        let snapshot = SnapshotStore.read(from: directory.appendingPathComponent(SharedContainer.snapshotFileName))
+        if let onDisk, Self.isLive(onDisk, snapshot: snapshot, at: launch.wall) {
+            // Left unseen: the first poll takes it under press rules.
+            self.lastSeenRefresh = (onDisk.session, onDisk.sequence - 1)
+            self.pressAtLaunch = nil
+        } else {
+            self.lastSeenRefresh = (onDisk?.session ?? "", onDisk?.sequence ?? 0)
+            self.pressAtLaunch = onDisk.map(AnsweredPress.init)
+        }
+    }
+
+    /// A press on disk at launch that may still be waiting for its answer:
+    /// inside its "Refreshing…" window (`RefreshState.window`), with no
+    /// snapshot naming it. The agent restarted between the press and its
+    /// answer; the intent has returned and the widget says "Refreshing…",
+    /// so the press is answered fresh, with its reload, like any other.
+    /// Every other press on disk at launch is old: seen, never taken.
+    static func isLive(_ request: RefreshRequest, snapshot: UsageSnapshot?, at date: Date) -> Bool {
+        RefreshState.isUserReload(request, at: date) && !RefreshState.answers(snapshot, request)
     }
 
     /// A press numbered past the last one seen in its session (a new

@@ -278,9 +278,11 @@ Shared code lives in the `Packages/UsageKit` package:
   A press is answered by a snapshot naming it or a later press of its
   session, never merely by a newer snapshot, so a clock correction, a
   deleted snapshot, a restart or a wrap of the numbers cannot fake an
-  answer. A press on disk when the agent starts counts as old, and the
-  restarted agent's first snapshot names it, so a restart does not strand
-  it either. Absent before the first press.
+  answer. A press on disk when the agent starts, still inside its 90 s
+  window and named by no snapshot (the agent restarted between the press
+  and its answer), is answered fresh with its reload, so a restart does
+  not strand it either; any other counts as old, and the restarted agent's
+  first snapshot names it. Absent before the first press.
 - Every file in the group container (the snapshot, refresh request,
   reload and writer state, Codex call log, both logs and the lock)
   and every Codex rollout is read and written through one helper. The

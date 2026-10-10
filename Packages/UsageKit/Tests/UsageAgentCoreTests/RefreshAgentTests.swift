@@ -754,18 +754,26 @@ final class RefreshAgentTests: XCTestCase {
         XCTAssertEqual(reloads.count, 2, "30% was never shown, so it is still a change")
     }
 
-    /// A press made before launch is not taken; the next one is, even with
-    /// the wall clock behind it.
-    func testARequestFromBeforeLaunchIsIgnored() async throws {
-        let dir = try makeTemporaryDirectory()
-        try RefreshRequestStore.request(in: dir, at: start.addingTimeInterval(-60))
+    /// A press on disk at launch is taken only while it could still be
+    /// waiting for its answer: inside its 90 s "Refreshing…" window with no
+    /// snapshot naming it. One past the window is old, and not taken; the
+    /// next press is, even with the wall clock behind it.
+    func testAPressFromBeforeLaunchIsTakenOnlyInsideItsWindow() async throws {
+        let inside = try makeTemporaryDirectory()
+        try RefreshRequestStore.request(in: inside, at: start.addingTimeInterval(-60))
         let clock = ManualClock(start)
-        let agent = UsageAgent(directory: dir, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp })
+        let live = UsageAgent(directory: inside, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp })
+        let takenInside = await live.takeRefreshRequest()
+        XCTAssertTrue(takenInside, "60 s old and unanswered: still waiting")
+
+        let past = try makeTemporaryDirectory()
+        try RefreshRequestStore.request(in: past, at: start.addingTimeInterval(-120))
+        let agent = UsageAgent(directory: past, runner: ScriptedRunner([ok()]), reload: {}, clock: { clock.stamp })
         let taken = await agent.takeRefreshRequest()
-        XCTAssertFalse(taken)
-        try RefreshRequestStore.request(in: dir, at: start.addingTimeInterval(-120))
+        XCTAssertFalse(taken, "120 s old: past its window")
+        try RefreshRequestStore.request(in: past, at: start.addingTimeInterval(-180))
         let next = await agent.takeRefreshRequest()
-        XCTAssertTrue(next)
+        XCTAssertTrue(next, "the next press is taken, whatever the wall clock says")
     }
 
     /// After the wall clock is set back an hour, a press still works.
