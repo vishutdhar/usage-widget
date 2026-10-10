@@ -4,7 +4,8 @@ import UsageCore
 /// What the status window shows about the background budget.
 public struct BudgetStatus: Equatable, Sendable {
     public var cap: Int
-    /// Requests in the trailing 24 hours.
+    /// Background requests in the trailing 24 hours (press reloads are not
+    /// among them).
     public var requests24h: Int
     /// The earliest an ordinary change could be requested.
     public var nextOrdinary: Date
@@ -81,11 +82,8 @@ public actor UsageAgent {
     /// press on disk (old, so counted as answered), else the snapshot's.
     private var answeredPress: AnsweredPress?
     private let pressAtLaunch: AnsweredPress?
-    /// A press's completion reload: at most one this often.
-    public static let pressReloadSpacing: TimeInterval = 10 * 60
     private var lastUserRefresh: SchedulerClock?
-    /// The press being answered: its time tells whether the intent was
-    /// still waiting when the answer was written.
+    /// The press taken for the next poll to answer.
     private var takenRequest: RefreshRequest?
     /// When this process started, as the scheduler measures time.
     private let launch: SchedulerClock
@@ -320,10 +318,9 @@ public actor UsageAgent {
     }
 
     /// Writes the last snapshot again under the next write number, naming
-    /// the press as answered, and logs it. Through the same
-    /// container check as a poll. A press noticed too late for its intent
-    /// to see the answer also gets the counted completion reload. False
-    /// when nothing could be written.
+    /// the press as answered, logs it, and asks for the press's reload, as
+    /// for any answered press. Through the same container check as a poll.
+    /// False when nothing could be written.
     private func answerWithTheLastSnapshot(_ request: RefreshRequest, at stamp: SchedulerClock) -> Bool {
         guard containerUsable(), var last = previous else { return false }
         last.writerId = writerId
@@ -340,19 +337,15 @@ public actor UsageAgent {
         previous = last
         try? CappedLog.append("\(ISODate.format(stamp.wall)) refresh press within 30 s of the last; answered with the last snapshot",
                               to: reloadLogURL, cap: SharedContainer.logCap)
-        if stamp.wall.timeIntervalSince(request.requestedAt) >= RefreshRequestStore.intentWait - RefreshRequestStore.intentPoll,
-           let candidate = completionCandidate(reloadState, current: DisplayFingerprint(last), stamp: stamp,
-                                               conservative: stateError != nil) {
-            if persistState(candidate.state) {
-                reloadState = candidate.state
-                reload()
-                let requests24h = candidate.state.requests.filter { stamp.seconds(since: $0) < ReloadScheduler.capWindow }.count
-                let status = last.provider(CswapListMapper.provider)?.status.rawValue ?? ProviderUsage.Status.error.rawValue
-                try? CappedLog.append(ReloadLog.line(at: stamp.wall, reasons: candidate.reasons, urgent: true, status: status,
-                                                     requests24h: requests24h, id: candidate.id, kind: .press),
-                                      to: reloadLogURL, cap: SharedContainer.logCap)
-            }
-        }
+        let press = pressReload(reloadState, current: DisplayFingerprint(last), stamp: stamp)
+        reloadState = press.state
+        persistState(press.state)
+        reload()
+        let requests24h = press.state.requests.filter { stamp.seconds(since: $0) < ReloadScheduler.capWindow }.count
+        let status = last.provider(CswapListMapper.provider)?.status.rawValue ?? ProviderUsage.Status.error.rawValue
+        try? CappedLog.append(ReloadLog.line(at: stamp.wall, reasons: press.reasons, urgent: true, status: status,
+                                             requests24h: requests24h, id: press.id, kind: .press),
+                              to: reloadLogURL, cap: SharedContainer.logCap)
         return true
     }
 
@@ -394,35 +387,27 @@ public actor UsageAgent {
         return true
     }
 
-    /// A press's completion reload, for a press whose answer came after the
-    /// intent's last look, when its gates allow: under the ceiling, a token
-    /// in the reload bucket (or one borrowed: an empty bucket lends one,
-    /// repaid by the next refill), at most one every 10 minutes, and inside
-    /// the conservative hour when the state cannot be saved. It takes the
-    /// token and counts like a background reload, so presses cannot push the
-    /// day past WidgetKit's budget; while a debt is owed it does not go, and
-    /// the change it would show is left to the background scheduler, which
-    /// shows it with the next token. It starts the background spacing and
-    /// records what it shows.
-    private func completionCandidate(_ state: ReloadState, current: DisplayFingerprint, stamp: SchedulerClock,
-                                     conservative: Bool) -> (state: ReloadState, id: Int, reasons: [ReloadReason])? {
+    /// A press's reload, asked for once the snapshot answering the press is
+    /// written, always: the press is the person's own and bounded by the
+    /// 30 s debounce, and WidgetKit keeps its own limits, so neither the
+    /// spacing, the daily cap nor the conservative hour holds it, and it
+    /// goes whether or not its record can be saved. It is numbered and
+    /// logged as a press, kept as the last press reload, starts the
+    /// background spacing and records what it shows, as a request does. It
+    /// takes no token from the reload bucket, borrows none, and is not
+    /// counted among the background requests the daily cap limits, so
+    /// background reloads keep their whole bucket and cap however often
+    /// the button is pressed.
+    private func pressReload(_ state: ReloadState, current: DisplayFingerprint, stamp: SchedulerClock)
+        -> (state: ReloadState, id: Int, reasons: [ReloadReason]) {
         var press = state
-        press.requests = state.requests.filter { stamp.seconds(since: $0) < ReloadScheduler.capWindow }
-        guard press.requests.count < ReloadScheduler.dailyCap,
-              state.lastCapExemption.map({ stamp.seconds(since: $0) >= Self.pressReloadSpacing }) ?? true,
-              !conservative || (state.lastRequest.map { stamp.seconds(since: $0) >= ReloadScheduler.conservativeSpacing } ?? true)
-        else { return nil }
-        // An empty bucket lends one token, so a press that worked redraws.
-        guard ReloadBucket.spend(&press, at: stamp, mayBorrow: true) else { return nil }
-        let reasons = ReloadScheduler.pressReasons(state, current: current, clock: stamp)
-        press.requests.append(stamp)
         press.lastRequest = stamp
         press.lastCapExemption = stamp
         press.requested = current
         press.pending = false
         press.pendingSince = nil
         let id = press.takeRequestId()
-        return (press, id, reasons)
+        return (press, id, ReloadScheduler.pressReasons(state, current: current, clock: stamp))
     }
 
     /// Logged when a press falls back to the cached list.
@@ -607,12 +592,9 @@ public actor UsageAgent {
         let current = DisplayFingerprint(next)
         var state = reloadState
         var fire: (id: Int, kind: ReloadLog.Kind, reasons: [ReloadReason], urgent: Bool)?
-        // A press's completion reload waits for the snapshot write: until
-        // its numbers are on disk nothing about them is saved as requested.
-        var pressCandidate: (state: ReloadState, id: Int, reasons: [ReloadReason])?
         if !answering {
-            // A press's poll never runs the background decision; whether it
-            // needs a completion reload is judged once its answer is written.
+            // A press's poll never runs the background decision: its reload
+            // is asked for once its answer is written.
             let (decision, decided) = ReloadScheduler.decide(state, current: current, clock: stamp,
                                                              conservative: conservative)
             state = decided
@@ -658,37 +640,20 @@ public actor UsageAgent {
         }
         previous = written
         answeredPress = written.answeredPress
-        // Lateness is judged now, with the answer on disk: cswap, Codex and
-        // the write all took their time (cswap alone may take up to 50 s).
-        // The intent looks for the answer every 0.25 s until its wait ends;
-        // a snapshot written within that is seen by its own unbudgeted
-        // reload, so only a later one needs the completion reload.
-        let answered = clock()
-        let tooLate = { (request: RefreshRequest) in
-            answered.wall.timeIntervalSince(request.requestedAt) >= RefreshRequestStore.intentWait - RefreshRequestStore.intentPoll
-        }
-        if answering, taken.map(tooLate) ?? true {
-            pressCandidate = completionCandidate(state, current: current, stamp: answered, conservative: conservative)
-        }
         // The press this snapshot names is answered, and so marked seen
         // (with any earlier one of its session): taking it again would run
-        // cswap once more. If the answer came too late for the intent to see
-        // it, and this poll asks for no reload of its own, the completion
-        // reload follows. A scheduled poll's cached numbers answer no press:
+        // cswap once more. A scheduled poll's cached numbers answer no press:
         // one made after its last look is taken by the loop and measured
         // fresh.
         if let answer, isUnseen(answer) {
             lastSeenRefresh = (answer.session, answer.sequence)
-            if fire == nil, pressCandidate == nil, tooLate(answer) {
-                pressCandidate = completionCandidate(state, current: current, stamp: answered, conservative: conservative)
-            }
         }
-        // The completion reload fires only once its time is saved.
-        if let pressCandidate {
-            if persistState(pressCandidate.state) {
-                state = pressCandidate.state
-                fire = (pressCandidate.id, .press, pressCandidate.reasons, true)
-            }
+        // A press's poll, its answer now on disk, asks for the press's
+        // reload, always (`pressReload`).
+        if answering {
+            let press = pressReload(state, current: current, stamp: clock())
+            state = press.state
+            fire = (press.id, .press, press.reasons, true)
         }
 
         reloadState = state

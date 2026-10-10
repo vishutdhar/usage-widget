@@ -1,8 +1,8 @@
 import Foundation
 
 /// The agent's reload log lines: one per reload it asks for, numbered, and
-/// marked background (a change worth showing) or press (a press's
-/// completion reload). Both count toward the daily cap.
+/// marked background (a change worth showing) or press (one for each
+/// answered press). `requests24h` counts the background ones.
 public enum ReloadLog {
     public enum Kind: String, Sendable {
         case background

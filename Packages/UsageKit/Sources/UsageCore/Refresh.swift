@@ -1,8 +1,8 @@
 import Foundation
 
 /// A press of the widget's refresh button. The widget's intent writes it
-/// into the shared container; the agent answers it with an immediate poll
-/// and one reload.
+/// into the shared container and returns; the agent answers it with an
+/// immediate fresh poll and, once that answer is written, one reload.
 public struct RefreshRequest: Codable, Equatable, Sendable {
     public var requestedAt: Date
     /// One more than the previous press: presses are told apart by number,
@@ -69,6 +69,18 @@ public enum RefreshFooter: Equatable, Sendable {
 public enum RefreshRequestStore {
     public static let fileName = "refresh-request.json"
 
+    /// What the refresh button's intent does, all of it: re-anchors a
+    /// container replaced at its path, writes the numbered request, and
+    /// returns at once. It never waits for the agent: WidgetKit's reload
+    /// after the intent then says "Refreshing…" (the pending press), and
+    /// the agent's own reload, once its snapshot answers the press, brings
+    /// the numbers.
+    @discardableResult
+    public static func press(in directory: URL, at date: Date) throws -> RefreshRequest {
+        _ = ContainerRoot.revalidate(directory)
+        return try request(in: directory, at: date)
+    }
+
     /// Writes a request made at `date` into `directory`, atomically,
     /// numbered one past the previous one. This and waiting for the answer
     /// are all the widget's intent does: the extension never runs a process.
@@ -98,48 +110,6 @@ public enum RefreshRequestStore {
         return request
     }
 
-    /// Waits, up to `timeout`, for the agent to write a snapshot that answers
-    /// the press (names it as answered); a newer snapshot from a background
-    /// poll does not end the wait. The intent does this before returning, so
-    /// the reload WidgetKit makes after it (not counted against the budget)
-    /// already shows the press's numbers, even when the agent's own reload
-    /// is held.
-    public enum WaitOutcome: Equatable, Sendable {
-        case answered
-        case timedOut
-        case cancelled
-    }
-
-    /// - Parameter read: reads the snapshot; tests count the reads.
-    /// How long the intent waits for the answering snapshot, and how often
-    /// it looks. Long enough for the slowest poll a press makes (cswap, plus
-    /// an app-server ask to Codex of up to 20 s), so the intent's own reload,
-    /// which is free, shows the fresh numbers; under the system's limit for
-    /// an intent. While it waits the system marks the widget's numbers as
-    /// being refreshed (`invalidatableContent`).
-    public static let intentWait: TimeInterval = 25
-    public static let intentPoll: TimeInterval = 0.25
-
-    public static func waitForAnswer(in directory: URL, to request: RefreshRequest, timeout: TimeInterval = intentWait,
-                                     interval: TimeInterval = intentPoll,
-                                     read: @Sendable (URL) -> UsageSnapshot? = { SnapshotStore.read(from: $0) })
-        async -> WaitOutcome
-    {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .milliseconds(Int(timeout * 1000)))
-        let url = directory.appendingPathComponent(SharedContainer.snapshotFileName)
-        while true {
-            if RefreshState.answers(read(url), request) { return .answered }
-            if clock.now >= deadline { return .timedOut }
-            do {
-                try await Task.sleep(for: .milliseconds(Int(interval * 1000)))
-            } catch {
-                // Cancelled: stop at once, without another read.
-                return .cancelled
-            }
-        }
-    }
-
     /// The last request, or nil when there is none or it cannot be read.
     /// Nil when missing, unreadable, or numbered outside 0..<Int.max/2.
     public static func read(in directory: URL) -> RefreshRequest? {
@@ -154,7 +124,9 @@ public enum RefreshRequestStore {
 }
 
 public enum RefreshState {
-    /// How long the widget says "Refreshing…" at most.
+    /// How long the widget says "Refreshing…" at most. An answered press
+    /// ends it in a second or three; a press the agent never answers shows
+    /// the last measured time again after this.
     public static let window: TimeInterval = 90
 
     /// A request the agent has not answered yet: made within the last

@@ -187,8 +187,8 @@ final class PressFreshTests: XCTestCase {
     /// A press made just before a scheduled poll, before the loop took it,
     /// makes that poll its answer: one cswap run, fresh, under a press's
     /// rules. The background decision does not run (a control agent without
-    /// the press reloads for the same change) and, answered in time for the
-    /// intent, it adds no completion reload.
+    /// the press reloads for the same change, as a background reload); its
+    /// one reload is the press's.
     func testAPressJustBeforeAScheduledPollMakesThatPollItsFreshAnswer() async throws {
         func run(pressing: Bool) async throws -> (runner: ScriptedRunner, reloads: Int, request: RefreshRequest?,
                                                     agent: UsageAgent, dir: URL) {
@@ -209,6 +209,7 @@ final class PressFreshTests: XCTestCase {
         let control = try await run(pressing: false)
         XCTAssertEqual(control.runner.freshFlags, [false, false])
         XCTAssertEqual(control.reloads, 2, "without a press the background decision shows the change")
+        XCTAssertTrue(log(control.dir).last?.contains("kind=background") ?? false, log(control.dir).last ?? "")
 
         let pressed = try await run(pressing: true)
         XCTAssertEqual(pressed.runner.freshFlags, [false, true], "the scheduled poll's one run is fresh")
@@ -217,19 +218,20 @@ final class PressFreshTests: XCTestCase {
         XCTAssertTrue(RefreshState.answers(snapshot, request), "its snapshot answers the press")
         let again = await pressed.agent.takeRefreshRequest()
         XCTAssertFalse(again, "the press is marked answered")
-        XCTAssertEqual(pressed.reloads, 1, "a press's rules: no background reload, no completion reload")
+        XCTAssertEqual(pressed.reloads, 2, "the first request, then the press's one reload")
+        XCTAssertTrue(log(pressed.dir).last?.contains("kind=press") ?? false, log(pressed.dir).last ?? "")
     }
 
     /// A press made while a scheduled poll's cached run is under way is
     /// answered by a fresh run after it, under a press's rules. What is
     /// published is the fresh run's (40%, measured at that run), not the
     /// cached run's (20%, measured five minutes earlier), and the footer
-    /// dates from it. No background reload goes and no token is spent for
-    /// an answer the intent sees; one completion reload, and its token,
-    /// only when the answer comes too late for the intent.
+    /// dates from it. Quick or slow, the answer gets the press's one
+    /// reload; no token is spent and no background request added: no
+    /// background reload goes.
     func testAPressDuringAScheduledPollIsAnsweredByAFreshRunAfterIt() async throws {
-        for (freshSeconds, late) in [(1.0, false), (RefreshRequestStore.intentWait + 5, true)] {
-            let name = late ? "answered late" : "answered in time"
+        for freshSeconds in [1.0, 30.0] {
+            let name = "fresh run of \(freshSeconds) s"
             let dir = try makeTemporaryDirectory()
             let clock = ManualClock(start)
             let reloads = Counter()
@@ -263,25 +265,19 @@ final class PressFreshTests: XCTestCase {
 
             let after = try XCTUnwrap(state(dir))
             let spent = ReloadBucket.tokens(before, at: clock.stamp) - ReloadBucket.tokens(after, at: clock.stamp)
-            if late {
-                XCTAssertEqual(reloads.count, 2, "\(name): one completion reload")
-                XCTAssertTrue(report.reloadReasons.contains(.user), name)
-                XCTAssertTrue(log(dir).last?.contains("kind=press") ?? false, "\(name): \(log(dir).last ?? "")")
-                XCTAssertEqual(after.requests.count, before.requests.count + 1, name)
-                XCTAssertEqual(spent, 1, accuracy: 1e-9, "\(name): the completion reload's token")
-            } else {
-                XCTAssertEqual(reloads.count, 1, "\(name): the intent's own reload shows it, no background reload")
-                XCTAssertEqual(report.reloadReasons, [], name)
-                XCTAssertEqual(after.requests.count, before.requests.count, name)
-                XCTAssertEqual(spent, 0, accuracy: 1e-9, "\(name): no background token spent")
-            }
+            XCTAssertEqual(reloads.count, 2, "\(name): the press's one reload")
+            XCTAssertTrue(report.reloadReasons.contains(.user), name)
+            XCTAssertTrue(log(dir).last?.contains("kind=press") ?? false, "\(name): \(log(dir).last ?? "")")
+            XCTAssertEqual(after.requests.count, before.requests.count, "\(name): no background request")
+            XCTAssertEqual(spent, 0, accuracy: 1e-9, "\(name): no token spent")
         }
     }
 
     /// A press made after a scheduled poll's last look but before its write:
     /// the cached snapshot is newer than the press but answers no press of
-    /// it, so the intent keeps waiting and the agent does not mark it
-    /// answered; the loop takes it and its fresh run is the answer. The
+    /// it, so the footer keeps saying "Refreshing…", no reload goes for the
+    /// press, and the agent does not mark it answered; the loop takes it and
+    /// its fresh run is the answer, with the press's one reload. The
     /// press is made on the poll's second clock reading (the first dates
     /// its run, the second its snapshot), and the test checks it landed in
     /// that window: after the last look (no fresh run in the poll) and
@@ -291,8 +287,11 @@ final class PressFreshTests: XCTestCase {
         let clock = ManualClock(start)
         let hook = ClockHook()
         let runner = ScriptedRunner([ok()])
-        let agent = UsageAgent(directory: dir, runner: runner, reload: {}, clock: { hook.read(); return clock.stamp })
+        let reloads = Counter()
+        let agent = UsageAgent(directory: dir, runner: runner, reload: { reloads.increment() },
+                               clock: { hook.read(); return clock.stamp })
         _ = await agent.tick()
+        let first = reloads.count
         clock.advance(60)
         let made = RequestBox()
         hook.arm(onRead: 2) { made.set(try? RefreshRequestStore.request(in: dir, at: clock.now)) }
@@ -302,14 +301,15 @@ final class PressFreshTests: XCTestCase {
         let cached = try XCTUnwrap(SnapshotStore.read(from: dir.appendingPathComponent(SharedContainer.snapshotFileName)))
         XCTAssertGreaterThan(cached.writeSequence ?? 0, request.afterSnapshot, "made before the poll's write")
         XCTAssertFalse(RefreshState.answers(cached, request), "the cached snapshot answers no press of it")
-        let waiting = await RefreshRequestStore.waitForAnswer(in: dir, to: request, timeout: 0.1, interval: 0.02)
-        XCTAssertEqual(waiting, .timedOut, "the intent keeps waiting")
+        XCTAssertEqual(WidgetContent.make(snapshot: cached, at: clock.now, refresh: request).refreshFooter, .refreshing)
+        XCTAssertEqual(reloads.count, first, "no reload for a press nothing answered")
         let taken = await agent.takeRefreshRequest()
         XCTAssertTrue(taken, "the cached snapshot did not mark it answered")
         _ = await agent.tick(userRequested: true)
         XCTAssertEqual(runner.freshFlags, [false, false, true])
-        let answered = await RefreshRequestStore.waitForAnswer(in: dir, to: request, timeout: 0.5, interval: 0.02)
-        XCTAssertEqual(answered, .answered, "the fresh run is the answer")
+        let answer = SnapshotStore.read(from: dir.appendingPathComponent(SharedContainer.snapshotFileName))
+        XCTAssertTrue(RefreshState.answers(answer, request), "the fresh run is the answer")
+        XCTAssertEqual(reloads.count, first + 1, "with the press's one reload")
     }
 
     /// A second press made while a press's fresh run is under way is named

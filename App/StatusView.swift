@@ -43,7 +43,7 @@ struct StatusView: View {
                             Text("Full").foregroundStyle(.secondary)
                         }
                     }
-                    LabeledContent("Reloads in the last day") {
+                    LabeledContent("Background reloads in the last day") {
                         Text("\(budget.requests24h)").monospacedDigit()
                     }
                     LabeledContent("Next ordinary reload") {
