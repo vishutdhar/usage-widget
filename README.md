@@ -170,7 +170,8 @@ codex app-server, at most 8 a day
   is shown as it is for a background poll.
 
   Every answered press gets its reload, logged as `kind=press`: a press
-  costs one reload request. It is never held by the 10 minute spacing,
+  costs one reload request, and a snapshot that answers several presses
+  at once (one made while another's fresh run was under way) reloads once. It is never held by the 10 minute spacing,
   the daily ceiling or the conservative hour, since a press is the
   person's own and the 30 second debounce bounds it (WidgetKit keeps its
   own limits). It takes no token from the bucket and is not counted
@@ -363,8 +364,8 @@ Scripts/state.sh 50   # snapshot, reload state, Codex call log, last 50 lines of
 - `reload-log.txt`: one line per reload the agent requested, with its
   reasons, whether it was urgent, the background requests in the last day,
   its number (`id=`) and its kind: `background` (a change worth showing) or
-  `press` (the reload for an answered press). Only background ones count
-  toward the 40.
+  `press` (the reload for an answered press). Only background ones take
+  a token or count toward the ceiling.
 - `timeline-log.txt`: one line per `getTimeline` call the widget received,
   with the widget family, the write number of the snapshot it loaded
   (`snapshot=`), that snapshot's time and age, the entry count, and when it
@@ -396,16 +397,20 @@ then a `press` line and the call after it, which brings the fresh numbers. Nothi
   creates no session or rollout files and leaves `auth.json` alone). With
   at most eight launches a day, that is at most eight small folders,
   usually one to four. The agent never deletes anything in `~/.codex`.
-- **Refresh budget.** WidgetKit decides when a widget actually reloads. The
-  agent asks at most 40 times a day for background changes and the
-  widget's own timeline at most 8, so a change can take 10 minutes to
-  appear, longer once the 40 are spent or if macOS is stricter. On top of
-  those, a press costs one reload request: the agent's reload once the
-  press's fresh answer is written (`cswap list --json --fresh`; with a
-  cswap from before that option, the cached list). The reload as the
-  intent returns is not budgeted. Presses take nothing from the 40, and
-  macOS may still hold a reload once its own budget is spent; the "as of"
-  line always says when the numbers on screen were measured.
+- **Refresh budget.** WidgetKit decides when a widget actually reloads,
+  roughly 40 to 70 times a day. The agent's background reloads each take
+  a token from a bucket that holds at most 6 and gains one every 36
+  minutes (40 a day), so a busy day that starts with a full bucket brings
+  at most 45 background reloads, with a ceiling of at most 47 in any 24
+  hours behind it; the widget's own timeline adds at most 8. A change can
+  take 10 minutes to appear, longer once the bucket is spent or if macOS
+  is stricter. On top of those, a press costs one reload request: the
+  agent's reload once the press's fresh answer is written
+  (`cswap list --json --fresh`; with a cswap from before that option, the
+  cached list). The reload as the intent returns is not budgeted. Presses
+  take no token and do not count toward the ceiling, and macOS may still
+  hold a reload once its own budget is spent; the "as of" line always
+  says when the numbers on screen were measured.
 
 ## Tests
 

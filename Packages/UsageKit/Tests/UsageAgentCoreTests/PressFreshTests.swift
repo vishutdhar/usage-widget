@@ -314,22 +314,38 @@ final class PressFreshTests: XCTestCase {
 
     /// A second press made while a press's fresh run is under way is named
     /// by that run's snapshot too: answered at once, with no second write
-    /// from the last snapshot and no second cswap run.
+    /// from the last snapshot and no second cswap run. One snapshot answers
+    /// both, so it needs one redraw: exactly one reload and one press line,
+    /// and the footer clears for either press.
     func testAPressMadeDuringAPressRunIsAnsweredByItsSnapshot() async throws {
         let dir = try makeTemporaryDirectory()
         let clock = ManualClock(start)
         let runner = PressingRunner(dir: dir, clock: clock, pressOnRun: 2)
-        let agent = UsageAgent(directory: dir, runner: runner, reload: {}, clock: { clock.stamp })
+        let reloads = Counter()
+        let agent = UsageAgent(directory: dir, runner: runner, reload: { reloads.increment() }, clock: { clock.stamp })
         _ = await agent.tick()
+        let reloadsBefore = reloads.count
+        let pressLinesBefore = log(dir).filter { $0.contains("kind=press") }.count
         clock.advance(60)
-        _ = try await press(agent, dir, clock)
+        let first = try RefreshRequestStore.request(in: dir, at: clock.now)
+        let took = await agent.takeRefreshRequest()
+        XCTAssertTrue(took)
+        _ = await agent.tick(userRequested: true)
         let second = try XCTUnwrap(runner.request, "made during the press's run")
         let snapshot = SnapshotStore.read(from: dir.appendingPathComponent(SharedContainer.snapshotFileName))
         XCTAssertEqual(snapshot?.answeredPress, AnsweredPress(second), "the snapshot names the newer press")
+        XCTAssertTrue(RefreshState.answers(snapshot, first), "and so answers the first")
+        XCTAssertTrue(RefreshState.answers(snapshot, second))
         let taken = await agent.takeRefreshRequest()
         XCTAssertFalse(taken)
         XCTAssertEqual(runner.runs.map(\.fresh), [false, true])
         XCTAssertEqual(log(dir).filter { $0.contains("answered with the last snapshot") }, [], "no second write for it")
+        XCTAssertEqual(reloads.count - reloadsBefore, 1, "one snapshot, one reload")
+        XCTAssertEqual(log(dir).filter { $0.contains("kind=press") }.count - pressLinesBefore, 1, "one press line")
+        for request in [first, second] {
+            XCTAssertEqual(WidgetContent.make(snapshot: snapshot, at: clock.now, refresh: request).refreshFooter,
+                           RefreshFooter.none, "the footer clears")
+        }
     }
 
     /// A background poll after a press's answer carries the answer forward:

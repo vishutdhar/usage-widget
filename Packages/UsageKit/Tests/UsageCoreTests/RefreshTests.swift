@@ -189,8 +189,28 @@ final class RefreshPressTests: XCTestCase {
         let readme = try String(contentsOf: repositoryRoot().appendingPathComponent("README.md"), encoding: .utf8)
         XCTAssertTrue(readme.contains("a press costs one reload request"))
         XCTAssertTrue(readme.contains("returns at once"))
-        for stale in ["24.75", "waits up to 25 seconds", "completion reload", "borrow"] {
+        for stale in ["24.75", "waits up to 25 seconds", "completion reload", "borrow", "at most 40 times a day"] {
             XCTAssertFalse(readme.contains(stale), stale)
+        }
+        XCTAssertTrue(readme.contains("reloads once"), "a snapshot answering several presses")
+    }
+
+    /// The README's "Refresh budget" states the scheduler's own numbers: the
+    /// bucket's size and refill, the 24 hour ceiling, and what a busy day
+    /// reaches (the bucket plus the refills before the day's last minute).
+    func testTheRefreshBudgetStatesTheSchedulersNumbers() throws {
+        let readme = try String(contentsOf: repositoryRoot().appendingPathComponent("README.md"), encoding: .utf8)
+        let start = try XCTUnwrap(readme.range(of: "- **Refresh budget.**"))
+        let paragraph = String(readme[start.lowerBound...].prefix { $0 != "#" }.split(separator: "\n\n").first ?? "")
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        let busyDay = Int(ReloadBucket.capacity) + Int((24 * 3600 - 1) / ReloadBucket.refill)
+        for stated in ["holds at most \(Int(ReloadBucket.capacity))",
+                       "one every \(Int(ReloadBucket.refill / 60)) minutes",
+                       "\(Int(24 * 3600 / ReloadBucket.refill)) a day",
+                       "at most \(ReloadScheduler.dailyCap) in any 24 hours",
+                       "at most \(busyDay) background reloads",
+                       "roughly 40 to 70"] {
+            XCTAssertTrue(paragraph.contains(stated), "\(stated) not in: \(paragraph)")
         }
     }
 

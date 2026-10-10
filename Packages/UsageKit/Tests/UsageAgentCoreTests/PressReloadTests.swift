@@ -195,6 +195,36 @@ final class PressReloadTests: XCTestCase {
         }
     }
 
+    /// With the day's background requests at the ceiling, a press is
+    /// answered fresh and reloaded, and a second press 10 s later gets the
+    /// debounced answer and its own reload too: the cap holds neither.
+    func testADebouncedAnswerReloadsAtTheCap() async throws {
+        let dir = try makeTemporaryDirectory()
+        let recent = (0..<ReloadScheduler.dailyCap).map { i in
+            SchedulerClock(wall: start.addingTimeInterval(Double(-60 - i * 60)), continuous: 0, boot: nil)
+        }
+        try ReloadStateStore.write(ReloadState(lastRequest: recent.first, requests: recent),
+                                   to: dir.appendingPathComponent(ReloadStateStore.fileName))
+        let clock = ManualClock(start)
+        let runner = ScriptedRunner([ok()])
+        let reloads = Counter()
+        let agent = UsageAgent(directory: dir, runner: runner, reload: { reloads.increment() }, clock: { clock.stamp })
+        clock.advance(5)
+        try RefreshRequestStore.request(in: dir, at: clock.now)
+        let taken = await agent.takeRefreshRequest()
+        XCTAssertTrue(taken)
+        _ = await agent.tick(userRequested: true)
+        XCTAssertEqual(runner.freshFlags, [true], "press A, measured fresh")
+        XCTAssertEqual(reloads.count, 1, "press A reloaded at the cap")
+        clock.advance(10)
+        let second = try RefreshRequestStore.request(in: dir, at: clock.now)
+        let again = await agent.takeRefreshRequest()
+        XCTAssertFalse(again, "inside the debounce")
+        XCTAssertTrue(RefreshState.answers(snapshot(dir), second), "press B answered from the last snapshot")
+        XCTAssertEqual(reloads.count, 2, "and reloaded at the cap")
+        XCTAssertEqual(pressLines(dir).count, 2)
+    }
+
     /// With the reload state unwritable, a press is answered and reloaded,
     /// and a second press 10 s later gets the debounced answer and its own
     /// reload too: neither waits on its record being saved.
