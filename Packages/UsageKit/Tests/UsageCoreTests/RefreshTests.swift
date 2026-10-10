@@ -158,69 +158,65 @@ final class RefreshPressTests: XCTestCase {
         XCTAssertEqual(RefreshRequestStore.read(in: dir)?.sequence, 0, "a request from before numbering")
     }
 
-    /// The intent waits for the agent's new snapshot, so the reload it
-    /// triggers already shows fresh numbers.
-    func testTheIntentWaitsForTheAgentsSnapshot() async throws {
+    /// The refresh button's intent writes the numbered request and returns
+    /// at once: it does not wait for the agent, so WidgetKit's reload after
+    /// it already says "Refreshing…" and the dimmed state ends in one
+    /// redraw. The agent's reload brings the numbers.
+    func testAPressReturnsAtOnceWithTheRequestWritten() throws {
         let dir = try tempDir()
-        let request = try RefreshRequestStore.request(in: dir, at: Date())
-        let snapshotURL = dir.appendingPathComponent(SharedContainer.snapshotFileName)
-        Task.detached {
-            try? await Task.sleep(for: .milliseconds(300))
-            try? SnapshotStore.write(UsageSnapshot(writtenAt: request.requestedAt.addingTimeInterval(-600), providers: [],
-                                                   writeSequence: request.afterSnapshot + 1,
-                                                   answeredPress: AnsweredPress(request)),
-                                     to: snapshotURL)
-        }
         let started = Date()
-        let answered = await RefreshRequestStore.waitForAnswer(in: dir, to: request, timeout: 5)
-        XCTAssertEqual(answered, .answered)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 2)
-
-        let later = try RefreshRequestStore.request(in: dir, at: Date())
-        let quiet = await RefreshRequestStore.waitForAnswer(in: dir, to: later, timeout: 0.4)
-        XCTAssertEqual(quiet, .timedOut, "no snapshot answers it: gives up at the timeout")
+        let request = try RefreshRequestStore.press(in: dir, at: t0)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.2, "no agent answered it, and it did not wait")
+        XCTAssertEqual(RefreshRequestStore.read(in: dir), request, "the request is on disk")
+        XCTAssertNil(SnapshotStore.read(from: dir.appendingPathComponent(SharedContainer.snapshotFileName)))
+        XCTAssertEqual(RefreshState.footer(request: request, snapshot: nil, at: t0.addingTimeInterval(0.5)), .refreshing)
     }
 
-    /// A background poll writes after the press: its snapshot is newer but
-    /// answers no press of it, so the wait goes on until the snapshot that
-    /// names the press lands (written here on the third look).
-    func testTheIntentWaitsPastABackgroundSnapshotForItsAnswer() async throws {
-        let dir = try tempDir()
-        let request = try RefreshRequestStore.request(in: dir, at: Date())
-        let url = dir.appendingPathComponent(SharedContainer.snapshotFileName)
-        try SnapshotStore.write(UsageSnapshot(writtenAt: Date(), providers: [], writeSequence: request.afterSnapshot + 1,
-                                              writerId: request.afterWriter), to: url)
-        let reads = ReadCounter()
-        let outcome = await RefreshRequestStore.waitForAnswer(in: dir, to: request, timeout: 5, interval: 0.01, read: { url in
-            reads.add()
-            if reads.count == 3 {
-                try? SnapshotStore.write(UsageSnapshot(writtenAt: Date(), providers: [], writeSequence: request.afterSnapshot + 2,
-                                                       answeredPress: AnsweredPress(request)), to: url)
-            }
-            return SnapshotStore.read(from: url)
-        })
-        XCTAssertEqual(outcome, .answered)
-        XCTAssertEqual(reads.count, 3, "the newer background snapshot did not end the wait; the answer did")
+    /// The widget's intent runs exactly that and nothing that waits.
+    func testTheIntentOnlyWritesThePress() throws {
+        let text = try String(contentsOf: repositoryRoot().appendingPathComponent("Widget/RefreshUsageIntent.swift"),
+                              encoding: .utf8)
+        XCTAssertTrue(text.contains("RefreshRequestStore.press(in: directory"))
+        for waiting in ["await ", "waitForAnswer", "sleep"] {
+            XCTAssertFalse(text.contains(waiting), waiting)
+        }
     }
 
-    /// Cancelled, the wait returns at once and reads nothing more.
-    func testACancelledWaitStopsAtOnce() async throws {
-        let dir = try tempDir()
-        let request = try RefreshRequestStore.request(in: dir, at: Date())
-        let reads = ReadCounter()
-        let task = Task {
-            await RefreshRequestStore.waitForAnswer(in: dir, to: request, timeout: 5, interval: 0.05,
-                                                    read: { url in reads.add(); return SnapshotStore.read(from: url) })
+    /// The README tells the press as it now works: the intent returns at
+    /// once, the agent's reload brings the numbers, and a press costs one
+    /// reload request; nothing of the old wait or completion reload.
+    func testTheReadmeDescribesTheInstantPress() throws {
+        let readme = try String(contentsOf: repositoryRoot().appendingPathComponent("README.md"), encoding: .utf8)
+        XCTAssertTrue(readme.contains("a press costs one reload request"))
+        XCTAssertTrue(readme.contains("returns at once"))
+        for stale in ["24.75", "waits up to 25 seconds", "completion reload", "borrow", "at most 40 times a day"] {
+            XCTAssertFalse(readme.contains(stale), stale)
         }
-        try await Task.sleep(for: .milliseconds(200))
-        let started = Date()
-        task.cancel()
-        let atCancel = reads.count
-        let outcome = await task.value
-        XCTAssertEqual(outcome, .cancelled)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 0.2)
-        try await Task.sleep(for: .milliseconds(200))
-        XCTAssertLessThanOrEqual(reads.count, atCancel + 1, "no reads after the cancel landed")
+        XCTAssertTrue(readme.contains("reloads once"), "a snapshot answering several presses")
+    }
+
+    /// The README's "Refresh budget" states the scheduler's own numbers: the
+    /// bucket's size and refill, the 24 hour ceiling, and what a busy day
+    /// reaches (the bucket plus the refills before the day's last minute).
+    func testTheRefreshBudgetStatesTheSchedulersNumbers() throws {
+        let readme = try String(contentsOf: repositoryRoot().appendingPathComponent("README.md"), encoding: .utf8)
+        let start = try XCTUnwrap(readme.range(of: "- **Refresh budget.**"))
+        let paragraph = String(readme[start.lowerBound...].prefix { $0 != "#" }.split(separator: "\n\n").first ?? "")
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        let busyDay = Int(ReloadBucket.capacity) + Int((24 * 3600 - 1) / ReloadBucket.refill)
+        for stated in ["holds at most \(Int(ReloadBucket.capacity))",
+                       "one every \(Int(ReloadBucket.refill / 60)) minutes",
+                       "\(Int(24 * 3600 / ReloadBucket.refill)) a day",
+                       "at most \(ReloadScheduler.dailyCap) in any 24 hours",
+                       "at most \(busyDay) background reloads",
+                       "roughly 40 to 70"] {
+            XCTAssertTrue(paragraph.contains(stated), "\(stated) not in: \(paragraph)")
+        }
+    }
+
+    func repositoryRoot() -> URL {
+        URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
     }
 
     /// A request numbered outside 0..<Int.max/2 reads as absent, and the
@@ -358,11 +354,4 @@ final class RefreshPressTests: XCTestCase {
             }
         }
     }
-}
-
-final class ReadCounter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = 0
-    func add() { lock.withLock { value += 1 } }
-    var count: Int { lock.withLock { value } }
 }

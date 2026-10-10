@@ -129,11 +129,10 @@ codex app-server, at most 8 a day
     the next token. A busy afternoon spends the saved tokens and then one
     every 36 minutes, so the night still gets reloads (a fixed 40 in 24
     hours used to run out by evening and leave the widget hours behind
-    overnight). A press's completion reload may borrow one token from an
-    empty bucket (one debt at most, repaid by the next refill), so a press
-    that worked always redraws. At most 47 in any 24 hours, a ceiling kept
-    as a backstop; with the widget's own 3 hour fallback (8 a day) the
-    worst day is 55.
+    overnight). A press's reload takes no token and is not counted here
+    (see Refresh button). At most 47 in any 24 hours, a ceiling kept as a
+    backstop; with the widget's own 3 hour fallback (8 a day) the worst
+    background day is 55.
     The status window shows the tokens and when the next one arrives.
 
   Ages use the continuous clock within a boot, so wall clock changes neither
@@ -142,48 +141,50 @@ codex app-server, at most 8 a day
   one request an hour and says so in the status window.
 - **Refresh button**: a circular arrow at the right of both sizes' footer.
   Its intent only writes `refresh-request.json` into the group container
-  (the extension never runs a process), and WidgetKit reloads the widget as
-  the intent returns. The agent answers with an immediate
+  and returns at once (the extension never runs a process and never waits
+  for the agent). WidgetKit reloads the widget as the intent returns, a
+  reload that is not budgeted, and that reload already says
+  "Refreshing…", so a press redraws once instead of dimming, showing the
+  old numbers again and redrawing a third time. The agent looks for a
+  press every half second and answers with an immediate
   `cswap list --json --fresh` and a new snapshot. `--fresh` makes cswap
   re-measure every account now (it serves as they are only the accounts it
   is holding back: quarantined, backing off after a 429, or claimed),
   where a background poll's `cswap list --json` serves an account's cached
   numbers while they are younger than cswap's serve time (3 to 10
-  minutes). The "as of" line keeps its rule (the oldest measurement on
-  screen), so after a press it shows the time of the press. A press made
-  just before or during a scheduled poll makes that poll its answer, under
-  a press's rules: the poll runs `--fresh`, and cached numbers it already
-  measured are not written. A press is answered only by a snapshot that
-  names it (`answeredPress`, below): the intent waits for one, and the
-  footer says "Refreshing…" until one lands, so a background poll's
-  snapshot written meanwhile, newer but naming no new press, ends neither.
-  A cswap from before `--fresh` refuses the option before doing any work
-  (argparse's exit status 2 and "error: unrecognized arguments: --fresh"
-  on stderr): the agent then measures the press once
-  more with the cached `cswap list --json` and writes one line, "press:
-  cswap has no --fresh; measured with the cached list", to
-  `reload-log.txt`. Any other failure is shown as it is for a background
-  poll. The reload WidgetKit makes after the intent is the
-  press's own and is not budgeted. Only when the answer is written too
-  late for the intent to see it (24.75 seconds or more after the press,
-  judged once the answer is
-  written) does the agent add one completion reload, at most one every 10
-  minutes, which takes a token (borrowing one from an empty bucket, one
-  debt at most) and counts like any background reload, so presses cannot
-  push the day past WidgetKit's budget, and obeys the conservative hour;
-  while a debt is owed the background scheduler shows the press's numbers
-  with the next token. A press never runs the background scheduler. Presses are
-  numbered by the intent under a random session id (a new session when the
-  file is deleted or damaged), so a clock set back does not stop them;
-  presses within 30 seconds of the last one are ignored. The agent looks
-  for a press every half second. The intent waits up to 25 seconds for the
-  new snapshot before returning (longer than the slowest poll, cswap plus
-  an app-server ask to Codex of up to 20 s), and while it waits the
-  system shows the widget's numbers as being refreshed; the reload
-  WidgetKit makes after it (not budgeted) then already shows the fresh
-  numbers. Until the agent answers, for
-  at most 90 seconds, the footer says "Refreshing…", then the plain "as of"
-  line; a press never shows anything about limits.
+  minutes). Once that snapshot is written the agent asks WidgetKit for one
+  reload, which shows the fresh numbers and an "as of" at the time of the
+  press (the line keeps its rule, the oldest measurement on screen), so
+  the footer says "Refreshing…" for the one to three seconds the
+  measurement takes. A press made just before or during a scheduled poll
+  makes that poll its answer, under a press's rules: the poll runs
+  `--fresh`, and cached numbers it already measured are not written. A
+  press is answered only by a snapshot that names it (`answeredPress`,
+  below), so a background poll's snapshot written meanwhile, newer but
+  naming no new press, does not end "Refreshing…". A cswap from before
+  `--fresh` refuses the option before doing any work (argparse's exit
+  status 2 and "error: unrecognized arguments: --fresh" on stderr): the
+  agent then measures the press once more with the cached
+  `cswap list --json` and writes one line, "press: cswap has no --fresh;
+  measured with the cached list", to `reload-log.txt`. Any other failure
+  is shown as it is for a background poll.
+
+  Every answered press gets its reload, logged as `kind=press`: a press
+  costs one reload request, and a snapshot that answers several presses
+  at once (one made while another's fresh run was under way) reloads once. It is never held by the 10 minute spacing,
+  the daily ceiling or the conservative hour, since a press is the
+  person's own and the 30 second debounce bounds it (WidgetKit keeps its
+  own limits). It takes no token from the bucket and is not counted
+  against the ceiling, so presses never cost the background its reloads;
+  like any request it starts the 10 minute spacing and records what the
+  widget now shows. A press never runs the background scheduler. Presses
+  are numbered by the intent under a random session id (a new session
+  when the file is deleted or damaged), so a clock set back does not stop
+  them. A press within 30 seconds of the last one handled runs no second
+  measurement: the agent answers it at once with the last snapshot, and
+  with its own reload. A press the agent never answers gets no reload,
+  and after 90 seconds the footer goes back to the last measured time; a
+  press never shows anything about limits.
   `"Usage Widget" --request-refresh` presses it from a terminal.
 - **Widget extension** (`com.vishutdhar.usagewidget.widget`): medium (the
   active account, at most three rows, then Codex on one line, then the other
@@ -278,9 +279,11 @@ Shared code lives in the `Packages/UsageKit` package:
   A press is answered by a snapshot naming it or a later press of its
   session, never merely by a newer snapshot, so a clock correction, a
   deleted snapshot, a restart or a wrap of the numbers cannot fake an
-  answer. A press on disk when the agent starts counts as old, and the
-  restarted agent's first snapshot names it, so a restart does not strand
-  it either. Absent before the first press.
+  answer. A press on disk when the agent starts, still inside its 90 s
+  window and named by no snapshot (the agent restarted between the press
+  and its answer), is answered fresh with its reload, so a restart does
+  not strand it either; any other counts as old, and the restarted agent's
+  first snapshot names it. Absent before the first press.
 - Every file in the group container (the snapshot, refresh request,
   reload and writer state, Codex call log, both logs and the lock)
   and every Codex rollout is read and written through one helper. The
@@ -359,9 +362,10 @@ Scripts/state.sh 50   # snapshot, reload state, Codex call log, last 50 lines of
 ```
 
 - `reload-log.txt`: one line per reload the agent requested, with its
-  reasons, whether it was urgent, the requests in the last day, its number
-  (`id=`) and its kind: `background` (a change worth showing) or `press` (a
-  press's completion reload). Both count toward the 40.
+  reasons, whether it was urgent, the background requests in the last day,
+  its number (`id=`) and its kind: `background` (a change worth showing) or
+  `press` (the reload for an answered press). Only background ones take
+  a token or count toward the ceiling.
 - `timeline-log.txt`: one line per `getTimeline` call the widget received,
   with the widget family, the write number of the snapshot it loaded
   (`snapshot=`), that snapshot's time and age, the entry count, and when it
@@ -370,10 +374,11 @@ Scripts/state.sh 50   # snapshot, reload state, Codex call log, last 50 lines of
 Both keep their newest 2,000 lines. To see how often macOS honours the
 agent's requests, read them side by side by hand: a `reload` line followed
 within a few seconds by a `getTimeline` line was most likely honoured. Some
-calls have other causes, which the logs do not tell apart: the reload after
-a press (a `press` line or a `refresh-request.json` just before it), the
-widget's own fallback (at an earlier line's `reloadAfter`), and system
-refreshes. Nothing in the app measures or adapts to this; the cap is fixed.
+calls have other causes, which the logs do not tell apart: the reload as a
+press's intent returns (a `refresh-request.json` just before it, with no
+`reload` line), the widget's own fallback (at an earlier line's
+`reloadAfter`), and system refreshes. A press shows as that first call,
+then a `press` line and the call after it, which brings the fresh numbers. Nothing in the app measures or adapts to this; the cap is fixed.
 
 ## Limitations
 
@@ -392,14 +397,20 @@ refreshes. Nothing in the app measures or adapts to this; the cap is fixed.
   creates no session or rollout files and leaves `auth.json` alone). With
   at most eight launches a day, that is at most eight small folders,
   usually one to four. The agent never deletes anything in `~/.codex`.
-- **Refresh budget.** WidgetKit decides when a widget actually reloads. The
-  agent asks at most 40 times a day and the widget's own timeline at most
-  8, so a change can take 10 minutes to appear, longer once the 40 are
-  spent or if macOS is stricter. The refresh button re-measures every
-  account (`cswap list --json --fresh`; with a cswap from before that
-  option, the cached list) and shows the numbers at once, through the
-  intent's own reload, which is not budgeted. The "as of" line always says
-  when the numbers on screen were measured.
+- **Refresh budget.** WidgetKit decides when a widget actually reloads,
+  roughly 40 to 70 times a day. The agent's background reloads each take
+  a token from a bucket that holds at most 6 and gains one every 36
+  minutes (40 a day), so a busy day that starts with a full bucket brings
+  at most 45 background reloads, with a ceiling of at most 47 in any 24
+  hours behind it; the widget's own timeline adds at most 8. A change can
+  take 10 minutes to appear, longer once the bucket is spent or if macOS
+  is stricter. On top of those, a press costs one reload request: the
+  agent's reload once the press's fresh answer is written
+  (`cswap list --json --fresh`; with a cswap from before that option, the
+  cached list). The reload as the intent returns is not budgeted. Presses
+  take no token and do not count toward the ceiling, and macOS may still
+  hold a reload once its own budget is spent; the "as of" line always
+  says when the numbers on screen were measured.
 
 ## Tests
 
